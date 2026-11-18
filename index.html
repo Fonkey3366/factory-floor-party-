@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Factory Floor Party</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0c0d10; color: #eee; font-family: 'Courier New', monospace; user-select: none; -webkit-user-select: none; touch-action: none; }
+  canvas { display: block; }
+  #ui { position: fixed; inset: 0; pointer-events: none; }
+  .panel { pointer-events: auto; background: rgba(18,19,24,.92); border: 2px solid #ff7a1a; padding: 22px 26px; box-shadow: 0 0 0 4px #0c0d10, 0 0 40px rgba(255,122,26,.25); }
+  #menu { position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%); width: min(92vw, 420px); text-align: center; }
+  h1 { margin: 0 0 4px; font-size: 30px; letter-spacing: 3px; color: #ff7a1a; text-transform: uppercase; }
+  .sub { margin: 0 0 18px; font-size: 12px; color: #9aa; }
+  input, button { font: inherit; font-size: 16px; padding: 11px 12px; border: 2px solid #444; background: #1b1c22; color: #fff; width: 100%; margin: 5px 0; }
+  input { text-transform: uppercase; text-align: center; letter-spacing: 3px; }
+  #name { text-transform: none; letter-spacing: 1px; }
+  button { cursor: pointer; background: #ff7a1a; color: #111; border-color: #ff7a1a; font-weight: bold; text-transform: uppercase; letter-spacing: 2px; }
+  button:hover { background: #ffa04d; }
+  button.alt { background: #1b1c22; color: #ff7a1a; }
+  .row { display: flex; gap: 8px; }
+  #err { color: #ff5a5a; min-height: 18px; font-size: 13px; }
+  #lobby { position: absolute; left: 50%; top: 50%; transform: translate(-50%,-50%); width: min(92vw, 420px); text-align: center; display: none; }
+  #code { font-size: 54px; letter-spacing: 10px; color: #ff7a1a; margin: 4px 0; }
+  .pl { display: flex; align-items: center; gap: 10px; padding: 7px 4px; border-bottom: 1px solid #2a2b33; text-align: left; }
+  .dot { width: 16px; height: 16px; border-radius: 3px; border: 2px solid #000; }
+  #hud { position: absolute; inset: 0; display: none; }
+  #top { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); text-align: center; text-shadow: 0 2px 0 #000; }
+  #gname { font-size: 20px; color: #ff7a1a; letter-spacing: 3px; text-transform: uppercase; }
+  #hint { font-size: 12px; color: #bbb; }
+  #score { position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,.55); padding: 8px 12px; font-size: 14px; min-width: 150px; }
+  #score div { display: flex; justify-content: space-between; gap: 14px; padding: 2px 0; }
+  #big { position: absolute; left: 0; right: 0; top: 30%; text-align: center; font-size: clamp(26px, 5vw, 64px); padding: 0 12px; font-weight: bold; text-shadow: 0 4px 0 #000; color: #fff; }
+  #roomtag { position: absolute; left: 10px; top: 10px; background: rgba(0,0,0,.55); padding: 6px 10px; font-size: 13px; }
+  .tag { position: absolute; transform: translate(-50%, -100%); font-size: 13px; font-weight: bold; text-shadow: 0 1px 0 #000, 0 0 4px #000; white-space: nowrap; }
+  #stick { position: absolute; left: 22px; bottom: 22px; width: 130px; height: 130px; border-radius: 50%; border: 2px solid rgba(255,255,255,.3); background: rgba(255,255,255,.06); display: none; pointer-events: auto; }
+  #knob { position: absolute; left: 41px; top: 41px; width: 48px; height: 48px; border-radius: 50%; background: rgba(255,122,26,.8); }
+  #shoveBtn { position: absolute; right: 22px; bottom: 34px; width: 96px; height: 96px; border-radius: 50%; display: none; pointer-events: auto; font-size: 14px; padding: 0; width: 96px; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div id="menu" class="panel">
+    <h1>Factory Floor Party</h1>
+    <p class="sub">2-4 players &middot; last one standing wins</p>
+    <input id="name" maxlength="12" placeholder="Your name" autocomplete="off">
+    <button id="createBtn">Create room</button>
+    <div class="row"><input id="joinCode" maxlength="4" placeholder="CODE"><button id="joinBtn" class="alt" style="width:40%">Join</button></div>
+    <div id="err"></div>
+  </div>
+  <div id="lobby" class="panel">
+    <div class="sub">ROOM CODE - share it with friends</div>
+    <div id="code">----</div>
+    <div id="plist"></div>
+    <button id="startBtn" style="margin-top:14px">Start game</button>
+    <div id="wait" class="sub" style="margin-top:10px"></div>
+    <div class="sub">WASD / arrows to move &middot; SPACE to shove</div>
+  </div>
+  <div id="hud">
+    <div id="roomtag"></div>
+    <div id="top"><div id="gname"></div><div id="hint"></div></div>
+    <div id="score"></div>
+    <div id="big"></div>
+    <div id="stick"><div id="knob"></div></div>
+    <button id="shoveBtn">SHOVE</button>
+  </div>
+</div>
+<div id="tags"></div>
+
+<script type="importmap">{ "imports": { "three": "/vendor/three/three.module.js" } }</script>
+<script type="module">
+import * as THREE from 'three';
+
+const N = 9, S = 2, HALF = N * S / 2;
+const $ = (id) => document.getElementById(id);
+
+// ---------- network ----------
+let ws, myId = null, roomCode = '', hostId = null, roomPlayers = [], state = null;
+function connect(then) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(proto + '://' + location.host);
+  ws.onopen = then;
+  ws.onmessage = (e) => onMsg(JSON.parse(e.data));
+  ws.onclose = () => { $('err').textContent = 'Disconnected. Reload the page.'; showMenu(); };
+}
+const send = (o) => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
+function onMsg(m) {
+  if (m.t === 'error') { $('err').textContent = m.msg; }
+  else if (m.t === 'joined') { myId = m.id; roomCode = m.code; }
+  else if (m.t === 'room') {
+    roomCode = m.code; hostId = m.hostId; roomPlayers = m.players;
+    renderLobby();
+  } else if (m.t === 'state') { state = m; onState(); }
+}
+function showMenu() { $('menu').style.display = ''; $('lobby').style.display = 'none'; $('hud').style.display = 'none'; }
+
+$('createBtn').onclick = () => { $('err').textContent = ''; connect(() => send({ t: 'create', name: $('name').value })); };
+$('joinBtn').onclick = () => {
+  const code = $('joinCode').value.trim();
+  if (code.length !== 4) { $('err').textContent = 'Enter the 4-letter code'; return; }
+  $('err').textContent = '';
+  connect(() => send({ t: 'join', code, name: $('name').value }));
+};
+$('startBtn').onclick = () => send({ t: 'start' });
+
+function renderLobby() {
+  $('menu').style.display = 'none';
+  $('code').textContent = roomCode;
+  $('plist').innerHTML = roomPlayers.map((p) =>
+    `<div class="pl"><span class="dot" style="background:${p.color}"></span>${esc(p.name)}${p.id === hostId ? ' (host)' : ''}${p.id === myId ? ' - you' : ''}</div>`).join('');
+  const isHost = myId === hostId;
+  $('startBtn').style.display = isHost ? '' : 'none';
+  $('wait').textContent = isHost ? (roomPlayers.length < 2 ? 'Solo test mode works too. Invite friends for the real thing.' : '') : 'Waiting for the host to start...';
+  if (!state || state.phase === 'lobby') { $('lobby').style.display = 'block'; $('hud').style.display = 'none'; }
+}
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+// ---------- three.js scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0c0d10);
+scene.fog = new THREE.Fog(0x0c0d10, 60, 130);
+const camera = new THREE.PerspectiveCamera(48, innerWidth / innerHeight, 0.1, 200);
+camera.position.set(0, 21, 15);
+camera.lookAt(0, 0, 1);
+
+scene.add(new THREE.HemisphereLight(0xb8c8ff, 0x4a3020, 1.6));
+const sun = new THREE.DirectionalLight(0xffe2c0, 2.6);
+sun.position.set(8, 20, 6);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1024, 1024);
+Object.assign(sun.shadow.camera, { left: -16, right: 16, top: 16, bottom: -16, near: 1, far: 50 });
+scene.add(sun);
+const warnLight = new THREE.PointLight(0xff3a1a, 0, 30);
+warnLight.position.set(0, 7, 0);
+scene.add(warnLight);
+
+// pit below the arena
+const pit = new THREE.Mesh(new THREE.PlaneGeometry(120, 120), new THREE.MeshBasicMaterial({ color: 0x050506, fog: false }));
+pit.rotation.x = -Math.PI / 2; pit.position.y = -12; scene.add(pit);
+// outer frame
+const frameMat = new THREE.MeshStandardMaterial({ color: 0x2b2d33, metalness: .6, roughness: .5 });
+for (const [w, d, x, z] of [[N * S + 2, 1, 0, HALF + .5], [N * S + 2, 1, 0, -HALF - .5], [1, N * S, HALF + .5, 0], [1, N * S, -HALF - .5, 0]]) {
+  const b = new THREE.Mesh(new THREE.BoxGeometry(w, 1.2, d), frameMat);
+  b.position.set(x, -0.1, z); b.receiveShadow = true; scene.add(b);
+}
+// hazard-stripe texture for press blocks
+function stripeTex() {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d'); g.fillStyle = '#ffb21a'; g.fillRect(0, 0, 64, 64); g.fillStyle = '#16161a';
+  for (let i = -64; i < 128; i += 32) { g.beginPath(); g.moveTo(i, 0); g.lineTo(i + 16, 0); g.lineTo(i + 80, 64); g.lineTo(i + 64, 64); g.fill(); }
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+const stripes = stripeTex();
+
+const tileGeo = new THREE.BoxGeometry(S - 0.08, 0.5, S - 0.08);
+const pressGeo = new THREE.BoxGeometry(S - 0.1, 1.6, S - 0.1);
+const tiles = [];
+for (let i = 0; i < N * N; i++) {
+  const x = ((i % N) - (N - 1) / 2) * S, z = (Math.floor(i / N) - (N - 1) / 2) * S;
+  const alt = ((i % N) + Math.floor(i / N)) % 2;
+  const mat = new THREE.MeshStandardMaterial({ color: alt ? 0x7d828e : 0x666a75, metalness: .5, roughness: .55 });
+  const mesh = new THREE.Mesh(tileGeo, mat);
+  mesh.position.set(x, -0.25, z); mesh.receiveShadow = true; mesh.castShadow = true;
+  scene.add(mesh);
+  const press = new THREE.Mesh(pressGeo, new THREE.MeshStandardMaterial({ map: stripes, metalness: .4, roughness: .5 }));
+  press.position.set(x, 9, z); press.castShadow = true; press.visible = false;
+  scene.add(press);
+  tiles.push({ mesh, mat, press, x, z, base: mat.color.getHex(), s: 0, fall: 0, py: 9 });
+}
+
+// robots
+const robots = new Map();
+function makeRobot(color) {
+  const g = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({ color, metalness: .35, roughness: .45 });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x15161a, metalness: .6, roughness: .4 });
+  const body = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.95, 0.7), mat); body.position.y = 0.85; body.castShadow = true;
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.55, 0.62), mat); head.position.y = 1.65; head.castShadow = true;
+  const visor = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.18, 0.1), new THREE.MeshBasicMaterial({ color: 0xffffff })); visor.position.set(0, 1.68, 0.33);
+  const legL = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.45, 0.3), dark); legL.position.set(-0.25, 0.22, 0);
+  const legR = legL.clone(); legR.position.x = 0.25;
+  const ant = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, 0.4), dark); ant.position.set(0.18, 2.1, 0);
+  const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.07), new THREE.MeshBasicMaterial({ color })); bulb.position.set(0.18, 2.32, 0);
+  g.add(body, head, visor, legL, legR, ant, bulb);
+  g.userData = { legL, legR, visor, mat };
+  scene.add(g);
+  return g;
+}
+const tagsEl = $('tags');
+function getRobot(p) {
+  let r = robots.get(p.id);
+  if (!r) {
+    const el = document.createElement('div'); el.className = 'tag'; el.style.color = p.color; el.textContent = p.name; tagsEl.appendChild(el);
+    r = { g: makeRobot(p.color), el, tx: p.x, tz: p.z, ty: p.y, lastX: p.x, lastZ: p.z };
+    r.g.position.set(p.x, p.y, p.z);
+    robots.set(p.id, r);
+  }
+  return r;
+}
+
+// ---------- state handling ----------
+let lastPhase = null, lastKey = '';
+function onState() {
+  const s = state;
+  if (s.phase === 'lobby') {
+    if (lastPhase !== 'lobby') { $('hud').style.display = 'none'; $('lobby').style.display = 'block'; }
+    lastPhase = 'lobby';
+    return;
+  }
+  if (lastPhase === 'lobby' || lastPhase === null) { $('lobby').style.display = 'none'; $('menu').style.display = 'none'; $('hud').style.display = 'block'; }
+  lastPhase = s.phase;
+  $('roomtag').textContent = 'ROOM ' + roomCode;
+  $('gname').textContent = s.gameName ? `Round ${Math.min(s.round, s.rounds)}/${s.rounds} - ${s.gameName}` : '';
+  $('hint').textContent = s.game === 'crumble' ? 'Floor cracks under your feet. Keep moving, shove rivals off.'
+    : s.game === 'crusher' ? 'Red zones = crusher incoming. Get out of them!' : '';
+  const sorted = [...s.players].sort((a, b) => b.score - a.score);
+  $('score').innerHTML = sorted.map((p) => `<div style="color:${p.color}"><span>${esc(p.name)}${p.alive ? '' : ' x'}</span><b>${p.score}</b></div>`).join('');
+
+  let big = '';
+  if (s.phase === 'countdown') big = s.timer > 0.6 ? String(Math.ceil(s.timer - 0.5)) : 'GO!';
+  else if (s.phase === 'roundEnd') {
+    const w = s.players.find((p) => p.id === s.winnerId);
+    big = w ? `${esc(w.name)} wins the round!` : 'Nobody wins!';
+  } else if (s.phase === 'final') {
+    const top = sorted[0];
+    big = `${esc(top.name)} wins the party!`;
+  }
+  $('big').innerHTML = big;
+  $('big').style.color = (s.phase === 'roundEnd' || s.phase === 'final') ? '#ffd21f' : '#fff';
+
+  // tiles
+  const key = s.tiles;
+  for (let i = 0; i < N * N; i++) tiles[i].s = +key[i];
+  // targets
+  const list = s.players;
+  for (const p of list) {
+    const r = getRobot(p);
+    r.tx = p.x; r.tz = p.z; r.ty = p.y; r.ry = p.ry; r.alive = p.alive; r.sq = p.sq; r.fx = p.fx; r.name = p.name;
+  }
+  for (const [id, r] of robots) if (!list.find((p) => p.id === id)) { scene.remove(r.g); r.el.remove(); robots.delete(id); }
+}
+
+// ---------- input ----------
+const keys = {};
+addEventListener('keydown', (e) => {
+  if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+  keys[e.code] = true;
+  if (e.code === 'Space') { send({ t: 'shove' }); e.preventDefault(); }
+});
+addEventListener('keyup', (e) => { keys[e.code] = false; });
+let joy = { x: 0, z: 0 };
+let lastSent = '';
+function readInput() {
+  let x = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
+  let z = (keys.KeyS || keys.ArrowDown ? 1 : 0) - (keys.KeyW || keys.ArrowUp ? 1 : 0);
+  x += joy.x; z += joy.z;
+  return { x: +Math.max(-1, Math.min(1, x)).toFixed(2), z: +Math.max(-1, Math.min(1, z)).toFixed(2) };
+}
+setInterval(() => {
+  const i = readInput(); const k = i.x + ',' + i.z;
+  if (k !== lastSent) { lastSent = k; send({ t: 'input', ...i }); }
+}, 33);
+
+// touch controls
+const isTouch = matchMedia('(pointer: coarse)').matches;
+if (isTouch) { $('stick').style.display = 'block'; $('shoveBtn').style.display = 'block'; }
+$('shoveBtn').addEventListener('touchstart', (e) => { send({ t: 'shove' }); e.preventDefault(); });
+const stick = $('stick'), knob = $('knob');
+function stickMove(t) {
+  const r = stick.getBoundingClientRect();
+  let dx = (t.clientX - (r.left + r.width / 2)) / 55, dy = (t.clientY - (r.top + r.height / 2)) / 55;
+  const l = Math.hypot(dx, dy); if (l > 1) { dx /= l; dy /= l; }
+  joy = { x: dx, z: dy };
+  knob.style.transform = `translate(${dx * 40}px, ${dy * 40}px)`;
+}
+stick.addEventListener('touchstart', (e) => { stickMove(e.touches[0]); e.preventDefault(); });
+stick.addEventListener('touchmove', (e) => { stickMove(e.touches[0]); e.preventDefault(); });
+stick.addEventListener('touchend', () => { joy = { x: 0, z: 0 }; knob.style.transform = ''; });
+
+// ---------- render loop ----------
+let lastT = performance.now(), elapsed = 0;
+const v3 = new THREE.Vector3();
+function frame() {
+  const now = performance.now();
+  const dt = Math.min((now - lastT) / 1000, 0.1); lastT = now; elapsed += dt;
+  const t = elapsed;
+  let anyWarn = false;
+
+  for (const T of tiles) {
+    const s = T.s;
+    let y = -0.25, col = T.base, emissive = 0x000000, shake = 0;
+    if (s === 1) { col = 0x8a5a2a; emissive = 0x401800; shake = 0.04; }
+    if (s === 2) { T.fall = Math.min(T.fall + dt * 14, 12); y = -0.25 - T.fall * T.fall * 0.25; } else T.fall = Math.max(0, T.fall - dt * 40);
+    if (s === 3) { anyWarn = true; const pulse = 0.5 + 0.5 * Math.sin(t * 18); col = 0x7a1a14; emissive = new THREE.Color(1, 0.1, 0.05).multiplyScalar(0.3 + 0.5 * pulse).getHex(); }
+    if (s === 4) { y = -0.45; col = 0x3a1a18; }
+    T.mesh.visible = !(s === 2 && T.fall > 8);
+    T.mesh.position.y += (y - T.mesh.position.y) * Math.min(1, dt * 20);
+    T.mesh.position.x = T.x + (shake ? (Math.random() - .5) * shake : 0);
+    T.mat.color.setHex(col); T.mat.emissive.setHex(emissive);
+    // press
+    const targetPy = s === 3 ? 3.2 : s === 4 ? 0.8 : 9;
+    T.py += (targetPy - T.py) * Math.min(1, dt * (s === 4 ? 30 : 4));
+    T.press.visible = T.py < 8.5;
+    T.press.position.y = T.py;
+  }
+  warnLight.intensity += ((anyWarn ? 25 : 0) - warnLight.intensity) * Math.min(1, dt * 8);
+
+  const me = robots.get(myId);
+  for (const [id, r] of robots) {
+    const g = r.g;
+    const k = Math.min(1, dt * 14);
+    g.position.x += (r.tx - g.position.x) * k;
+    g.position.z += (r.tz - g.position.z) * k;
+    g.position.y += (r.ty - g.position.y) * Math.min(1, dt * 20);
+    // face movement
+    if (r.ry !== undefined) { let d = r.ry - g.rotation.y; d = Math.atan2(Math.sin(d), Math.cos(d)); g.rotation.y += d * Math.min(1, dt * 12); }
+    const speed = Math.hypot(r.tx - r.lastX, r.tz - r.lastZ) / Math.max(dt, 0.001);
+    r.lastX = g.position.x; r.lastZ = g.position.z;
+    const walk = Math.sin(t * 14) * Math.min(1, speed / 4) * 0.4;
+    g.userData.legL.position.z = walk * 0.5; g.userData.legR.position.z = -walk * 0.5;
+    g.position.y += Math.abs(Math.sin(t * 14)) * Math.min(1, speed / 4) * 0.05;
+    const targetSY = r.sq ? 0.08 : 1;
+    g.scale.y += (targetSY - g.scale.y) * Math.min(1, dt * 30);
+    g.scale.x = g.scale.z = r.sq ? 1.5 : 1;
+    g.visible = r.ty > -12;
+    g.rotation.x = r.fx ? -0.3 : 0;
+    // name tag
+    v3.copy(g.position); v3.y += 2.7; v3.project(camera);
+    r.el.style.left = ((v3.x * .5 + .5) * innerWidth) + 'px';
+    r.el.style.top = ((-v3.y * .5 + .5) * innerHeight) + 'px';
+    r.el.style.display = (g.visible && !r.sq && (r.alive || r.ty > -3)) ? '' : 'none';
+    r.el.textContent = r.name + (id === myId ? ' (you)' : '');
+  }
+  renderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+frame();
+
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.position.set(0, innerWidth < innerHeight ? 30 : 21, innerWidth < innerHeight ? 20 : 15);
+  camera.lookAt(0, 0, 1);
+  camera.updateProjectionMatrix();
+});
+dispatchEvent(new Event('resize'));
+</script>
+</body>
+</html>
