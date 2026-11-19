@@ -490,8 +490,8 @@ function buildLocal(box) {
   box.addEventListener('change', (e) => {
     const k = e.target.dataset.lk; if (!k) return;
     local[k] = (k === 'camera' || k === 'volume') ? e.target.value : e.target.value === 'true';
-    if (k === 'sound' || k === 'volume') { initAudio(); if (local.sound) sfx.beep(); }
     saveLocal(); applyLocal(); syncLocalUI();
+    if (k === 'sound' || k === 'volume') { initAudio(); applyVolume(); if (local.sound) sfx.beep(); }
   });
 }
 function syncLocalUI() {
@@ -523,9 +523,58 @@ $('plist').onclick = (e) => { const id = e.target.dataset.kick; if (id) send({ t
 $('swatches').onclick = (e) => { const c = e.target.dataset.c; if (c) send({ t: 'color', c }); };
 
 // ---------- state handling ----------
-let lastPhase = null;
+let lastPhase = null, prevState = null;
+
+// Compare the new server update with the previous one and play matching sounds.
+function playDiff(prev, s) {
+  if (!prev || s.phase === 'lobby') return;
+  if (s.phase === 'countdown') {
+    const n = s.timer > 0.6 ? Math.ceil(s.timer - 0.5) : 0;
+    const pn = prev.phase === 'countdown' ? (prev.timer > 0.6 ? Math.ceil(prev.timer - 0.5) : 0) : -1;
+    if (n !== pn) { if (n > 0) sfx.beep(); else sfx.go(); }
+  }
+  if (prev.phase === 'lobby') return;
+  if (prev.phase !== s.phase) {
+    if (s.phase === 'roundEnd') { if (s.winnerId) sfx.win(); else sfx.nobody(); }
+    if (s.phase === 'final') sfx.fanfare();
+  }
+  // floor tiles
+  let crack = 0, fall = 0, warn = 0, slam = 0;
+  for (let i = 0; i < s.tiles.length; i++) {
+    const a = prev.tiles[i], b = s.tiles[i];
+    if (a === b) continue;
+    if (b === '1') crack++; else if (b === '2') fall++; else if (b === '3') warn++; else if (b === '4') slam++;
+  }
+  if (crack && gate('crack', 90)) sfx.crack();
+  if (fall && gate('tfall', 200)) sfx.tileFall();
+  if (warn && gate('warn', 250)) sfx.warn();
+  if (slam && gate('slam', 120)) sfx.slam();
+  // players
+  for (const p of s.players) {
+    const pp = prev.players.find((q) => q.id === p.id);
+    if (!pp) continue;
+    if (p.act && !pp.act) {
+      if (pp.w === 'hammer') sfx.swing();
+      else if (!pp.w && gate('shove' + p.id, 200)) sfx.shove();
+    }
+    if (p.hit && !pp.hit && s.game !== 'bomb' && gate('hit' + p.id, 120)) sfx.whack();
+    if (pp.alive && !p.alive) {
+      if (p.dm === 1) sfx.splat(); else if (p.dm === 2) sfx.zap(); else sfx.fall();
+    }
+    if (!pp.w && p.w && gate('pick' + p.id, 150)) sfx.pickup();
+  }
+  // weapons and explosions
+  const had = (list, id) => list.some((x) => x.id === id);
+  if (s.proj.some((b) => !had(prev.proj, b.id)) && gate('pew', 60)) sfx.pew();
+  if (s.bombs.some((b) => !had(prev.bombs, b.id)) && gate('thunk', 60)) sfx.thunk();
+  if (s.fx.some((f) => !had(prev.fx, f.id)) && gate('boom', 80)) sfx.boom();
+  if (prev.holder && s.holder && prev.holder !== s.holder) sfx.pass();
+}
+
 function onState() {
   const s = state;
+  const prev = prevState; prevState = s;
+  playDiff(prev, s);
   if (s.phase === 'lobby') {
     if (lastPhase !== 'lobby') { $('hud').style.display = 'none'; $('lobby').style.display = 'block'; $('mypanel').style.display = 'none'; }
     lastPhase = 'lobby';
@@ -646,7 +695,7 @@ stick.addEventListener('touchmove', (e) => { stickMove(e.touches[0]); e.preventD
 stick.addEventListener('touchend', () => { joy = { x: 0, z: 0 }; knob.style.transform = ''; });
 
 // ---------- render loop ----------
-let lastT = performance.now(), elapsed = 0;
+let lastT = performance.now(), elapsed = 0, tickAcc = 0;
 const v3 = new THREE.Vector3();
 function frame() {
   const now = performance.now();
@@ -671,6 +720,12 @@ function frame() {
     T.press.position.y = T.py;
   }
   warnLight.intensity += ((anyWarn ? 25 : 0) - warnLight.intensity) * Math.min(1, dt * 8);
+
+  // hot bomb fuse ticking gets faster as it runs down
+  if (state && state.game === 'bomb' && state.phase === 'play' && state.holder) {
+    tickAcc -= dt;
+    if (tickAcc <= 0) { sfx.tick(state.fuse < 3); tickAcc = state.fuse < 3 ? 0.15 : state.fuse < 6 ? 0.35 : 0.7; }
+  }
 
   // world objects
   for (const m of pickupMeshes.values()) { m.item.rotation.y += dt * 2.2; m.item.position.y = 1.0 + Math.sin(t * 3) * 0.12; }
