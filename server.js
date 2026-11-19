@@ -178,6 +178,26 @@ function tileAt(x, z) {
   return r * N + c;
 }
 
+// ---- hitbox helpers ----
+// A little leniency past the edge, so a tiny overhang does not drop you.
+function tileUnder(x, z) {
+  if (Math.abs(x) > HALF + 0.3 || Math.abs(z) > HALF + 0.3) return -1;
+  const cl = (v) => Math.max(-HALF + 0.01, Math.min(HALF - 0.01, v));
+  return tileAt(cl(x), cl(z));
+}
+// Does a circle (a player's body) overlap a tile at all?
+function circleHitsTile(px, pz, c, r) {
+  const dx = Math.max(Math.abs(px - c.x) - S / 2, 0), dz = Math.max(Math.abs(pz - c.z) - S / 2, 0);
+  return dx * dx + dz * dz < r * r;
+}
+// Shortest distance from a point to the path a fast projectile travelled this tick.
+function segDist(px, pz, ax, az, bx, bz) {
+  const abx = bx - ax, abz = bz - az;
+  const l2 = abx * abx + abz * abz || 1;
+  const t = Math.max(0, Math.min(1, ((px - ax) * abx + (pz - az) * abz) / l2));
+  return Math.hypot(px - (ax + abx * t), pz - (az + abz * t));
+}
+
 // tile states: 0 ok, 1 cracking, 2 gone, 3 crusher warning, 4 crushed,
 // 5 lightning warning, 6 lightning strike, 7 chair, 8 "no chair" warning
 function newRoom(code) {
@@ -464,7 +484,7 @@ function movePlayers(room, players, dt, active) {
   if (room.game && active) {
     for (const p of players) {
       if (!p.alive || p.falling) continue;
-      const ti = tileAt(p.x, p.z);
+      const ti = tileUnder(p.x, p.z);
       if (ti < 0 || room.tiles[ti].s === 2) {
         p.falling = true; p.vy = 0;
         if (room.game !== 'hill') eliminate(room, p, 0);
@@ -524,7 +544,7 @@ function updateHazards(room, players, dt) {
           const c = tileCenter(i);
           for (const p of players) {
             if (!p.alive || p.falling) continue;
-            if (Math.abs(p.x - c.x) < S / 2 + 0.15 && Math.abs(p.z - c.z) < S / 2 + 0.15) eliminate(room, p, 1);
+            if (circleHitsTile(p.x, p.z, c, 0.3)) eliminate(room, p, 1);
           }
         }
       } else if (t.s === 4) {
@@ -558,11 +578,12 @@ function updateArmory(room, players, live, dt, rate) {
     }
   }
   room.proj = room.proj.filter((b) => {
+    const ox = b.x, oz = b.z;
     b.x += b.dx * 20 * dt; b.z += b.dz * 20 * dt; b.life -= dt;
     if (b.life <= 0 || Math.abs(b.x) > HALF + 4 || Math.abs(b.z) > HALF + 4) return false;
     for (const p of live) {
       if (p.id === b.owner || !p.alive) continue;
-      if (Math.hypot(p.x - b.x, p.z - b.z) < 0.85) {
+      if (segDist(p.x, p.z, ox, oz, b.x, b.z) < 0.75) { // swept check: fast shots cannot skip over a player
         const owner = players.find((q) => q.id === b.owner);
         damage(room, p, 1, owner);
         knock(room, p, b.x - b.dx, b.z - b.dz, 9, owner);
@@ -662,7 +683,7 @@ function updateDisasters(room, players, live, dt, rate) {
         const c = tileCenter(i);
         for (const p of players) {
           if (!p.alive || p.falling) continue;
-          if (Math.abs(p.x - c.x) < S / 2 + 0.2 && Math.abs(p.z - c.z) < S / 2 + 0.2) eliminate(room, p, 2, false);
+          if (circleHitsTile(p.x, p.z, c, 0.3)) eliminate(room, p, 2, false);
         }
       }
     } else if (t.s === 6) { t.t -= dt; if (t.t <= 0) t.s = 0; }
@@ -775,7 +796,7 @@ function updateZombies(room, players, live, dt, rate) {
   for (const z of zs) {
     for (const p of live) {
       if (!p.alive || p.falling) continue;
-      if (Math.hypot(p.x - z.x, p.z - z.z) < 0.95) eliminate(room, p, 2, false);
+      if (Math.hypot(p.x - z.x, p.z - z.z) < 0.85) eliminate(room, p, 2, false);
     }
   }
   room.zombies = zs.filter((z) => Math.abs(z.x) < HALF + 0.6 && Math.abs(z.z) < HALF + 0.6);
@@ -829,7 +850,7 @@ function doAct(room, p) {
       for (const q of players) {
         if (q === p || !q.alive || q.falling) continue;
         const dx = q.x - p.x, dz = q.z - p.z, d = Math.hypot(dx, dz);
-        if (d > 0 && d < 2.5 && (dx * dirx + dz * dirz) / d > 0.3) {
+        if (d > 0 && d < 2.7 && (dx * dirx + dz * dirz) / d > 0.25) {
           knock(room, q, p.x, p.z, 24, p);
           damage(room, q, 2, p);
         }
