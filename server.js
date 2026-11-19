@@ -1,4 +1,4 @@
-// Party game server: static files + WebSocket rooms + minigame simulation.
+// Party game server: static files + server list + WebSocket rooms + minigame simulation.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -14,26 +14,6 @@ const MIME = {
   '.svg': 'image/svg+xml',
 };
 
-// ---------- static file server ----------
-const server = http.createServer((req, res) => {
-  const url = decodeURIComponent(req.url.split('?')[0]);
-  let base, rel;
-  if (url.startsWith('/vendor/three/')) {
-    base = path.join(__dirname, 'node_modules', 'three', 'build');
-    rel = url.slice('/vendor/three/'.length);
-  } else {
-    base = path.join(__dirname, 'public');
-    rel = url === '/' ? 'index.html' : url.slice(1);
-  }
-  const file = path.normalize(path.join(base, rel));
-  if (!file.startsWith(base)) { res.writeHead(403); return res.end(); }
-  fs.readFile(file, (err, data) => {
-    if (err) { res.writeHead(404); return res.end('Not found'); }
-    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
-    res.end(data);
-  });
-});
-
 // ---------- constants ----------
 const N = 9;              // tiles per side
 const S = 2;              // tile size
@@ -47,16 +27,46 @@ const GAMES = {
   crusher: 'Crusher Zone',
   armory: 'Armory Brawl',
   bomb: 'Hot Bomb',
+  meteors: 'Falling Meteors',
+  disasters: 'Natural Disasters',
+  hill: 'King of the Hill',
+  zombies: 'Zombie Survival',
+  chairs: 'Musical Chairs',
 };
+const TIMED = { hill: 45, zombies: 40 }; // seconds, these modes end on a timer
+const HILL_R = 2.6;
 const SPEEDS = { slow: 5.2, normal: 6.5, fast: 8.2 };
 const SHOVES = { off: 0, normal: 15, strong: 26 };
 const HAZ = { chill: 0.7, normal: 1, chaos: 1.6 };
 const WEAPON_AMMO = { blaster: 6, hammer: 4, grenade: 2 };
+const DISASTERS = ['earthquake', 'flood', 'tornado', 'lightning'];
+const DIS_DUR = { earthquake: 6, flood: 8, tornado: 8, lightning: 7 };
+const DIS_NAMES = { earthquake: 'EARTHQUAKE!', flood: 'FLOOD! The edges are going under', tornado: 'TORNADO! Stay away from the vortex', lightning: 'LIGHTNING STORM!' };
+// cosmetics: the server only checks that ids exist (ownership is stored in each player's browser)
+const HATS = ['cone', 'horns', 'prop', 'tophat', 'halo', 'crown'];
+const VISORS = ['cyan', 'pink', 'gold', 'rainbow'];
+const TRAILS = ['sparks', 'bubbles', 'hearts'];
+
+const cleanText = (v, max, d) => {
+  const t = String(v == null ? '' : v).replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, max);
+  return t || d;
+};
+function cleanCos(c) {
+  const o = { hat: '', visor: '', trail: '' };
+  if (c && typeof c === 'object') {
+    if (HATS.includes(c.hat)) o.hat = c.hat;
+    if (VISORS.includes(c.visor)) o.visor = c.visor;
+    if (TRAILS.includes(c.trail)) o.trail = c.trail;
+  }
+  return o;
+}
 
 function defaultSettings() {
   return {
+    roomName: 'Party room',
+    isPublic: true,
     rounds: 5,
-    modes: { crumble: true, crusher: true, armory: true, bomb: true },
+    modes: Object.fromEntries(Object.keys(GAMES).map((g) => [g, true])),
     order: 'random',
     hp: 3,
     speed: 'normal',
@@ -73,6 +83,8 @@ function applySettings(s, inc) {
   if (!inc || typeof inc !== 'object') return;
   const int = (v, lo, hi, d) => { v = Math.round(+v); return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : d; };
   const pick = (v, table, d) => (typeof v === 'string' && Object.hasOwn(table, v) ? v : d);
+  if (typeof inc.roomName === 'string') s.roomName = cleanText(inc.roomName, 24, s.roomName);
+  if (typeof inc.isPublic === 'boolean') s.isPublic = inc.isPublic;
   s.rounds = int(inc.rounds, 1, 12, s.rounds);
   s.hp = int(inc.hp, 1, 5, s.hp);
   s.winBonus = int(inc.winBonus, 0, 5, s.winBonus);
@@ -114,6 +126,38 @@ function buildPlan(s) {
 
 const rooms = new Map();
 
+// ---------- http: static files + server list ----------
+const server = http.createServer((req, res) => {
+  const url = decodeURIComponent(req.url.split('?')[0]);
+  if (url === '/api/rooms') {
+    const list = [...rooms.values()].filter((r) => r.settings.isPublic).map((r) => {
+      const host = r.clients.get(r.hostId);
+      return {
+        code: r.code, name: r.settings.roomName, host: host ? host.p.name : '',
+        players: r.clients.size, max: MAX_PLAYERS, phase: r.phase,
+        round: r.round + 1, rounds: r.plan.length || r.settings.rounds,
+      };
+    });
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify(list));
+  }
+  let base, rel;
+  if (url.startsWith('/vendor/three/')) {
+    base = path.join(__dirname, 'node_modules', 'three', 'build');
+    rel = url.slice('/vendor/three/'.length);
+  } else {
+    base = path.join(__dirname, 'public');
+    rel = url === '/' ? 'index.html' : url.slice(1);
+  }
+  const file = path.normalize(path.join(base, rel));
+  if (!file.startsWith(base)) { res.writeHead(403); return res.end(); }
+  fs.readFile(file, (err, data) => {
+    if (err) { res.writeHead(404); return res.end('Not found'); }
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
+    res.end(data);
+  });
+});
+
 function makeCode() {
   const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
   for (;;) {
@@ -134,7 +178,8 @@ function tileAt(x, z) {
   return r * N + c;
 }
 
-// tile states: 0 ok, 1 cracking, 2 gone, 3 warning, 4 crushed
+// tile states: 0 ok, 1 cracking, 2 gone, 3 crusher warning, 4 crushed,
+// 5 lightning warning, 6 lightning strike, 7 chair, 8 "no chair" warning
 function newRoom(code) {
   return {
     code,
@@ -158,7 +203,14 @@ function newRoom(code) {
     proj: [],
     bombs: [],
     fx: [],
+    meteors: [],
+    zombies: [],
     bomb: { holder: 0, fuse: 0, pause: 0 },
+    dis: { kind: '', t: 0, dur: 0, calm: 2.5, last: '', acc: 0, q: 0, vx: 0, vz: 0 },
+    floodRing: 0,
+    hill: { x: 0, z: 0, t: 12, owner: 0, contested: false },
+    mc: { phase: 'music', t: 5, chairs: [], wave: 0 },
+    info: '',
     startCount: 0,
   };
 }
@@ -181,6 +233,15 @@ function spawnPickup(room, x, z, type) {
   room.pickups.push({ id: room.eid++, type, x, z });
 }
 
+function spawnZombie(room) {
+  const side = Math.floor(Math.random() * 4);
+  const u = (Math.random() * 2 - 1) * (HALF - 1);
+  let x, z;
+  if (side === 0) { x = u; z = -HALF + 0.3; } else if (side === 1) { x = u; z = HALF - 0.3; }
+  else if (side === 2) { x = -HALF + 0.3; z = u; } else { x = HALF - 0.3; z = u; }
+  room.zombies.push({ id: room.eid++, x, z, kx: 0, kz: 0, ry: 0 });
+}
+
 function startRound(room) {
   room.game = room.plan[room.round];
   room.phase = 'countdown';
@@ -190,8 +251,13 @@ function startRound(room) {
   room.pending = [];
   room.winnerId = null;
   room.spawnTimer = 2;
-  room.pickups = []; room.proj = []; room.bombs = []; room.fx = [];
+  room.info = '';
+  room.pickups = []; room.proj = []; room.bombs = []; room.fx = []; room.meteors = []; room.zombies = [];
   room.bomb = { holder: 0, fuse: 0, pause: 2.5 };
+  room.dis = { kind: '', t: 0, dur: 0, calm: 2.5, last: '', acc: 0, q: 0, vx: 0, vz: 0 };
+  room.floodRing = 0;
+  room.hill = { x: 0, z: 0, t: 12, owner: 0, contested: false };
+  room.mc = { phase: 'music', t: 4 + Math.random() * 3, chairs: [], wave: 0 };
   resetTiles(room);
   const list = playersOf(room);
   room.startCount = list.length;
@@ -202,7 +268,7 @@ function startRound(room) {
     p.ix = p.iz = 0;
     p.alive = true; p.falling = false; p.dm = 0;
     p.shoveCd = 0; p.actFx = 0; p.useCd = 0; p.passCd = 0; p.hitFx = 0;
-    p.rank = 0; p.kills = 0; p.gain = 0;
+    p.rank = 0; p.kills = 0; p.gain = 0; p.coins = 0; p.ht = 0; p.respawn = 0;
     p.hp = room.settings.hp; p.weapon = ''; p.ammo = 0;
     p.lastHitBy = 0; p.lastHitT = -99;
     p.ry = Math.atan2(-p.x, -p.z);
@@ -212,6 +278,7 @@ function startRound(room) {
     spawnPickup(room, -4, 3, 'hammer');
     spawnPickup(room, 4, 3, 'grenade');
   }
+  if (room.game === 'zombies') { spawnZombie(room); spawnZombie(room); spawnZombie(room); }
 }
 
 // dm: 0 fell, 1 squished, 2 zapped
@@ -249,9 +316,45 @@ function damage(room, victim, dmg, attacker) {
   if (victim.hp <= 0) eliminate(room, victim, 2);
 }
 
+function finishRound(room, players) {
+  const s = room.settings;
+  const n = players.length;
+  let winner = null;
+  if (room.game === 'hill') {
+    players.forEach((p) => { p.rank = 1 + players.filter((q) => q.ht < p.ht).length; });
+    const top = Math.max(...players.map((p) => p.ht));
+    const tops = players.filter((p) => p.ht === top);
+    if (n > 1 && tops.length === 1 && top > 0) winner = tops[0];
+  } else {
+    const alive = players.filter((p) => p.alive);
+    alive.forEach((p) => { p.rank = n; });
+    if (alive.length === 1 && n > 1) winner = alive[0];
+  }
+  const last = room.round === room.plan.length - 1;
+  const mult = last ? s.finalMult : 1;
+  players.forEach((p) => {
+    let g = 0;
+    if (s.survivalPts) g += p.rank - 1;
+    if (p === winner) g += s.winBonus;
+    g += p.kills * s.killPts;
+    g *= mult;
+    p.gain = g;
+    p.score += g;
+    // coins for playing (a flat small amount when playing alone so it cannot be farmed)
+    p.coins = n < 2 ? 2 : (5 + (p.rank - 1) * 3 + (p === winner ? 10 : 0) + p.kills * 2) * (last ? 2 : 1);
+  });
+  room.clients.forEach((c) => {
+    if (c.ws.readyState === 1) c.ws.send(JSON.stringify({ t: 'coins', n: c.p.coins }));
+  });
+  room.winnerId = winner ? winner.id : null;
+  room.phase = 'roundEnd';
+  room.timer = 4;
+}
+
 function update(room) {
   const dt = TICK;
   const players = playersOf(room);
+  room.info = '';
 
   if (room.phase === 'countdown') {
     room.timer -= dt;
@@ -270,28 +373,12 @@ function update(room) {
 
   if (room.phase === 'play') {
     settleDeaths(room);
-    const s = room.settings;
     const alive = players.filter((p) => p.alive);
     const limit = room.startCount > 1 ? 1 : 0;
-    if (alive.length <= limit || room.elapsed > 90) {
-      const n = players.length;
-      const last = room.round === room.plan.length - 1;
-      const mult = last ? s.finalMult : 1;
-      alive.forEach((p) => { p.rank = n; });
-      const winner = alive.length === 1 && n > 1 ? alive[0] : null;
-      players.forEach((p) => {
-        let g = 0;
-        if (s.survivalPts) g += p.rank - 1;
-        if (p === winner) g += s.winBonus;
-        g += p.kills * s.killPts;
-        g *= mult;
-        p.gain = g;
-        p.score += g;
-      });
-      room.winnerId = winner ? winner.id : null;
-      room.phase = 'roundEnd';
-      room.timer = 4;
-    }
+    let over;
+    if (room.game === 'hill') over = room.elapsed >= TIMED.hill;
+    else over = alive.length <= limit || room.elapsed > (TIMED[room.game] || 90);
+    if (over) finishRound(room, players);
   } else if (room.phase === 'roundEnd') {
     room.timer -= dt;
     if (room.timer <= 0) {
@@ -309,9 +396,9 @@ function toLobby(room) {
   room.phase = 'lobby';
   room.round = 0;
   room.game = null;
-  room.pickups = []; room.proj = []; room.bombs = []; room.fx = [];
+  room.pickups = []; room.proj = []; room.bombs = []; room.fx = []; room.meteors = []; room.zombies = [];
   room.clients.forEach((c) => {
-    Object.assign(c.p, { score: 0, alive: true, falling: false, dm: 0, y: 0, gain: 0, weapon: '', ammo: 0 });
+    Object.assign(c.p, { score: 0, alive: true, falling: false, dm: 0, y: 0, gain: 0, coins: 0, ht: 0, weapon: '', ammo: 0, respawn: 0 });
   });
   resetTiles(room);
   broadcast(room, lobbyInfo(room));
@@ -327,11 +414,22 @@ function movePlayers(room, players, dt, active) {
     p.hitFx = Math.max(0, p.hitFx - dt);
     if (!p.alive && !p.falling) continue;
     if (p.falling) {
+      if (p.respawn > 0) { // King of the Hill: come back after a short wait
+        p.respawn -= dt;
+        if (p.respawn <= 0) {
+          const a = Math.random() * Math.PI * 2;
+          p.x = Math.cos(a) * 7; p.z = Math.sin(a) * 7; p.y = 0;
+          p.vx = p.vz = p.kx = p.kz = p.vy = 0; p.falling = false; p.hitFx = 0;
+        }
+        continue;
+      }
       p.vy -= 28 * dt;
       p.y += p.vy * dt;
       p.x += (p.vx + p.kx) * dt;
       p.z += (p.vz + p.kz) * dt;
-      if (p.y < -7) { p.falling = false; p.y = -20; }
+      if (p.y < -7) {
+        if (room.game === 'hill' && active) { p.respawn = 1.8; p.y = -20; } else { p.falling = false; p.y = -20; }
+      }
       continue;
     }
     let ix = p.ix, iz = p.iz;
@@ -367,7 +465,10 @@ function movePlayers(room, players, dt, active) {
     for (const p of players) {
       if (!p.alive || p.falling) continue;
       const ti = tileAt(p.x, p.z);
-      if (ti < 0 || room.tiles[ti].s === 2) { p.falling = true; p.vy = 0; eliminate(room, p, 0); }
+      if (ti < 0 || room.tiles[ti].s === 2) {
+        p.falling = true; p.vy = 0;
+        if (room.game !== 'hill') eliminate(room, p, 0);
+      }
     }
   }
 }
@@ -376,6 +477,9 @@ function updateHazards(room, players, dt) {
   const tiles = room.tiles;
   const rate = HAZ[room.settings.hazards];
   const live = players.filter((p) => p.alive && !p.falling);
+
+  // cracking tiles fall away (every mode except Crumbling Floor, which has its own handling)
+  if (room.game !== 'crumble') tiles.forEach((t) => { if (t.s === 1) { t.t -= dt; if (t.t <= 0) t.s = 2; } });
 
   if (room.game === 'crumble') {
     for (const p of live) {
@@ -432,16 +536,19 @@ function updateHazards(room, players, dt) {
 
   if (room.game === 'armory') updateArmory(room, players, live, dt, rate);
   if (room.game === 'bomb') updateBomb(room, players, live, dt, rate);
+  if (room.game === 'meteors') updateMeteors(room, players, live, dt, rate);
+  if (room.game === 'disasters') updateDisasters(room, players, live, dt, rate);
+  if (room.game === 'hill') updateHill(room, players, live, dt);
+  if (room.game === 'zombies') updateZombies(room, players, live, dt, rate);
+  if (room.game === 'chairs') updateChairs(room, players, live, dt);
 }
 
 function updateArmory(room, players, live, dt, rate) {
-  // spawn pickups
   room.spawnTimer -= dt;
   if (room.spawnTimer <= 0) {
     if (room.pickups.length < 5) spawnPickup(room);
     room.spawnTimer = 2.8 / rate;
   }
-  // collect
   for (const p of live) {
     if (p.weapon) continue;
     const idx = room.pickups.findIndex((k) => Math.hypot(k.x - p.x, k.z - p.z) < 1.0);
@@ -450,7 +557,6 @@ function updateArmory(room, players, live, dt, rate) {
       p.weapon = k.type; p.ammo = WEAPON_AMMO[k.type];
     }
   }
-  // projectiles
   room.proj = room.proj.filter((b) => {
     b.x += b.dx * 20 * dt; b.z += b.dz * 20 * dt; b.life -= dt;
     if (b.life <= 0 || Math.abs(b.x) > HALF + 4 || Math.abs(b.z) > HALF + 4) return false;
@@ -465,7 +571,6 @@ function updateArmory(room, players, live, dt, rate) {
     }
     return true;
   });
-  // grenades
   room.bombs = room.bombs.filter((b) => {
     b.t -= dt;
     if (b.t > 0) return true;
@@ -486,7 +591,7 @@ function updateArmory(room, players, live, dt, rate) {
 function updateBomb(room, players, live, dt, rate) {
   const b = room.bomb;
   const cur = live.find((p) => p.id === b.holder);
-  if (b.holder && !cur) { b.holder = 0; b.pause = 1.2; } // holder left or fell
+  if (b.holder && !cur) { b.holder = 0; b.pause = 1.2; }
   if (!b.holder) {
     b.pause -= dt;
     if (b.pause <= 0 && live.length) {
@@ -498,7 +603,6 @@ function updateBomb(room, players, live, dt, rate) {
     return;
   }
   b.fuse -= dt;
-  // pass on touch
   if (cur.passCd <= 0) {
     for (const q of live) {
       if (q === cur) continue;
@@ -513,6 +617,202 @@ function updateBomb(room, players, live, dt, rate) {
     room.fx.push({ id: room.eid++, k: 'boom', x: h.x, z: h.z, t: 0.6 });
     eliminate(room, h, 2, false);
     b.holder = 0; b.pause = 2;
+  }
+}
+
+// ----- Falling Meteors: glowing rocks drop on marked circles -----
+function updateMeteors(room, players, live, dt, rate) {
+  room.spawnTimer -= dt;
+  if (room.spawnTimer <= 0) {
+    const count = Math.max(1, Math.min(6, Math.round((1 + Math.floor(room.elapsed / 10)) * rate)));
+    for (let k = 0; k < count; k++) {
+      let x, z;
+      if (live.length && Math.random() < 0.5) {
+        const p = live[Math.floor(Math.random() * live.length)];
+        x = p.x + (Math.random() - 0.5) * 1.6; z = p.z + (Math.random() - 0.5) * 1.6;
+      } else { x = (Math.random() * 2 - 1) * (HALF - 1); z = (Math.random() * 2 - 1) * (HALF - 1); }
+      room.meteors.push({ id: room.eid++, x, z, t: 0, dur: Math.max(1.1, 1.8 - room.elapsed * 0.01) / Math.sqrt(rate) });
+    }
+    room.spawnTimer = Math.max(0.9, 2.4 - room.elapsed * 0.025) / rate;
+  }
+  room.meteors = room.meteors.filter((m) => {
+    m.t += dt;
+    if (m.t < m.dur) return true;
+    room.fx.push({ id: room.eid++, k: 'boom', x: m.x, z: m.z, t: 0.6 });
+    for (const p of players) {
+      if (!p.alive || p.falling) continue;
+      const d = Math.hypot(p.x - m.x, p.z - m.z);
+      if (d < 1.9) eliminate(room, p, 2, false);
+      else if (d < 3.6) knock(room, p, m.x, m.z, 16 * (1 - (d - 1.9) / 1.7), null);
+    }
+    const ti = tileAt(m.x, m.z);
+    if (ti >= 0 && room.tiles[ti].s === 0 && Math.random() < 0.35) { room.tiles[ti].s = 1; room.tiles[ti].t = 0.5; }
+    return false;
+  });
+}
+
+// ----- Natural Disasters: a random disaster every few seconds -----
+function updateDisasters(room, players, live, dt, rate) {
+  const d = room.dis, tiles = room.tiles;
+  tiles.forEach((t, i) => {
+    if (t.s === 5) {
+      t.t -= dt;
+      if (t.t <= 0) {
+        t.s = 6; t.t = 0.4;
+        const c = tileCenter(i);
+        for (const p of players) {
+          if (!p.alive || p.falling) continue;
+          if (Math.abs(p.x - c.x) < S / 2 + 0.2 && Math.abs(p.z - c.z) < S / 2 + 0.2) eliminate(room, p, 2, false);
+        }
+      }
+    } else if (t.s === 6) { t.t -= dt; if (t.t <= 0) t.s = 0; }
+  });
+  if (!d.kind) {
+    d.calm -= dt;
+    room.info = `Next disaster in ${Math.max(1, Math.ceil(d.calm))}s...`;
+    if (d.calm <= 0) {
+      const opts = DISASTERS.filter((k) => k !== d.last);
+      d.kind = opts[Math.floor(Math.random() * opts.length)];
+      d.last = d.kind; d.t = 0; d.dur = DIS_DUR[d.kind]; d.acc = 0; d.q = 0;
+    }
+    return;
+  }
+  d.t += dt; d.acc -= dt; d.q -= dt;
+  room.info = `${DIS_NAMES[d.kind]} ${Math.ceil(Math.max(0, d.dur - d.t))}s`;
+  if (d.kind === 'earthquake') {
+    if (d.acc <= 0) {
+      for (let k = 0; k < 3; k++) {
+        const ok = tiles.map((t, i) => (t.s === 0 ? i : -1)).filter((i) => i >= 0);
+        if (ok.length) { const i = ok[Math.floor(Math.random() * ok.length)]; tiles[i].s = 1; tiles[i].t = 0.7; }
+      }
+      d.acc = 0.5 / rate;
+    }
+    if (d.q <= 0) {
+      live.forEach((p) => { const a = Math.random() * Math.PI * 2; knock(room, p, p.x - Math.cos(a), p.z - Math.sin(a), 6, null); });
+      d.q = 0.35;
+    }
+  } else if (d.kind === 'flood') {
+    if (d.acc <= 0 && room.floodRing < 3) {
+      const ringMax = 4 - room.floodRing;
+      tiles.forEach((t, i) => {
+        const c = i % N, r = Math.floor(i / N);
+        if (Math.max(Math.abs(c - 4), Math.abs(r - 4)) === ringMax && t.s === 0) { t.s = 1; t.t = 0.6; }
+      });
+      room.floodRing++;
+      d.acc = 2.4 / rate;
+    }
+  } else if (d.kind === 'tornado') {
+    d.vx = 6 * Math.sin(d.t * 0.55 + 1); d.vz = 5 * Math.sin(d.t * 0.85);
+    for (const p of live) {
+      const dx = d.vx - p.x, dz = d.vz - p.z, dist = Math.hypot(dx, dz) || 1;
+      if (dist < 5) {
+        const f = 1 - dist / 5;
+        p.kx += ((dx / dist) * 36 + (-dz / dist) * 18) * f * dt;
+        p.kz += ((dz / dist) * 36 + (dx / dist) * 18) * f * dt;
+        if (dist < 1.0) eliminate(room, p, 2, false);
+      }
+    }
+  } else if (d.kind === 'lightning') {
+    if (d.acc <= 0) {
+      for (let k = 0; k < 2; k++) {
+        let i;
+        if (live.length && Math.random() < 0.6) { const p = live[Math.floor(Math.random() * live.length)]; i = tileAt(p.x, p.z); }
+        else i = Math.floor(Math.random() * N * N);
+        if (i >= 0 && tiles[i].s === 0) { tiles[i].s = 5; tiles[i].t = 0.9; }
+      }
+      d.acc = 0.55 / rate;
+    }
+  }
+  if (d.t >= d.dur) { d.kind = ''; d.calm = 3; }
+}
+
+// ----- King of the Hill: stand alone in the zone to score -----
+function updateHill(room, players, live, dt) {
+  const h = room.hill;
+  h.t -= dt;
+  if (h.t <= 0) {
+    const spots = [-6, -3, 0, 3, 6];
+    let nx, nz, tries = 0;
+    do { nx = spots[Math.floor(Math.random() * 5)]; nz = spots[Math.floor(Math.random() * 5)]; tries++; }
+    while (Math.hypot(nx - h.x, nz - h.z) < 4 && tries < 20);
+    h.x = nx; h.z = nz; h.t = 12;
+  }
+  const inside = live.filter((p) => Math.hypot(p.x - h.x, p.z - h.z) < HILL_R);
+  h.contested = inside.length > 1;
+  h.owner = inside.length === 1 ? inside[0].id : 0;
+  if (inside.length === 1) inside[0].ht += dt;
+  room.info = `Hold the hill alone to score! ${Math.ceil(Math.max(0, TIMED.hill - room.elapsed))}s left`;
+}
+
+// ----- Zombie Survival: everyone against the horde -----
+function updateZombies(room, players, live, dt, rate) {
+  room.spawnTimer -= dt;
+  if (room.spawnTimer <= 0) {
+    if (room.zombies.length < 20) spawnZombie(room);
+    room.spawnTimer = Math.max(0.7, 2.4 - room.elapsed * 0.04) / rate;
+  }
+  const speed = Math.min(4.6, 2.6 + room.elapsed * 0.04) * Math.sqrt(rate);
+  const zs = room.zombies;
+  for (const z of zs) {
+    let best = null, bd = 1e9;
+    for (const p of live) { const d = Math.hypot(p.x - z.x, p.z - z.z); if (d < bd) { bd = d; best = p; } }
+    let vx = 0, vz = 0;
+    if (best && bd > 0.01) { vx = ((best.x - z.x) / bd) * speed; vz = ((best.z - z.z) / bd) * speed; z.ry = Math.atan2(vx, vz); }
+    z.x += (vx + z.kx) * dt; z.z += (vz + z.kz) * dt;
+    const dec = Math.exp(-4.5 * dt);
+    z.kx *= dec; z.kz *= dec;
+  }
+  for (let i = 0; i < zs.length; i++) {
+    for (let j = i + 1; j < zs.length; j++) {
+      const dx = zs[j].x - zs[i].x, dz = zs[j].z - zs[i].z, d = Math.hypot(dx, dz);
+      if (d > 0 && d < 0.8) {
+        const push = (0.8 - d) / 2;
+        zs[i].x -= (dx / d) * push; zs[i].z -= (dz / d) * push;
+        zs[j].x += (dx / d) * push; zs[j].z += (dz / d) * push;
+      }
+    }
+  }
+  for (const z of zs) {
+    for (const p of live) {
+      if (!p.alive || p.falling) continue;
+      if (Math.hypot(p.x - z.x, p.z - z.z) < 0.95) eliminate(room, p, 2, false);
+    }
+  }
+  room.zombies = zs.filter((z) => Math.abs(z.x) < HALF + 0.6 && Math.abs(z.z) < HALF + 0.6);
+  room.info = `Survive! ${Math.ceil(Math.max(0, TIMED.zombies - room.elapsed))}s left. Shove zombies away!`;
+}
+
+// ----- Musical Chairs: when the music stops, grab a chair -----
+function updateChairs(room, players, live, dt) {
+  const mc = room.mc, tiles = room.tiles;
+  mc.t -= dt;
+  if (mc.phase === 'music') {
+    room.info = 'Music is playing... get ready!';
+    if (mc.t <= 0) {
+      const k = Math.max(1, live.length - 1);
+      const idx = shuffle(tiles.map((_, i) => i)).slice(0, k);
+      mc.chairs = idx;
+      tiles.forEach((t, i) => { t.s = idx.includes(i) ? 7 : 8; });
+      mc.phase = 'stop'; mc.t = Math.max(2.2, 3.4 - mc.wave * 0.25); mc.wave++;
+    }
+  } else if (mc.phase === 'stop') {
+    room.info = `FIND A CHAIR! ${Math.max(1, Math.ceil(mc.t))}s`;
+    if (mc.t <= 0) {
+      tiles.forEach((t) => { if (t.s === 8) t.s = 2; });
+      for (const i of mc.chairs) {
+        const c = tileCenter(i);
+        const on = players.filter((p) => p.alive && !p.falling && Math.abs(p.x - c.x) < S / 2 && Math.abs(p.z - c.z) < S / 2)
+          .sort((a, b) => Math.hypot(a.x - c.x, a.z - c.z) - Math.hypot(b.x - c.x, b.z - c.z));
+        on.slice(1).forEach((p) => eliminate(room, p, 2, false)); // only one player per chair
+      }
+      mc.phase = 'reset'; mc.t = 2.2;
+    }
+  } else if (mc.phase === 'reset') {
+    room.info = 'Chairs reset...';
+    if (mc.t <= 0) {
+      tiles.forEach((t) => { t.s = 0; t.stand = 0; });
+      mc.chairs = []; mc.phase = 'music'; mc.t = 4 + Math.random() * 3.5;
+    }
   }
 }
 
@@ -545,8 +845,7 @@ function doAct(room, p) {
     if (p.ammo <= 0) { p.weapon = ''; p.ammo = 0; }
     return;
   }
-  if (room.game === 'armory' && p.weapon) return; // weapon cooling down
-  // shove
+  if (room.game === 'armory' && p.weapon) return;
   const force = SHOVES[room.settings.shove];
   if (force <= 0 || p.shoveCd > 0) return;
   p.shoveCd = 1.2; p.actFx = 0.25;
@@ -555,28 +854,42 @@ function doAct(room, p) {
     const d = Math.hypot(q.x - p.x, q.z - p.z);
     if (d > 0 && d < 2.4) knock(room, q, p.x, p.z, force, p);
   });
+  room.zombies.forEach((z) => {
+    const dx = z.x - p.x, dz = z.z - p.z, d = Math.hypot(dx, dz);
+    if (d > 0 && d < 2.6) { z.kx += (dx / d) * force * 1.2; z.kz += (dz / d) * force * 1.2; }
+  });
 }
 
 function snapshot(room) {
   const players = playersOf(room);
+  const g = room.game;
+  const timed = TIMED[g];
   return {
     t: 'state',
     phase: room.phase,
-    game: room.game,
-    gameName: room.game ? GAMES[room.game] : '',
+    game: g,
+    gameName: g ? GAMES[g] : '',
     timer: Math.round(room.timer * 10) / 10,
     round: room.round + 1,
     rounds: room.plan.length || room.settings.rounds,
     winnerId: room.winnerId,
+    info: room.info,
+    left: timed && room.phase === 'play' ? Math.max(0, Math.round((timed - room.elapsed) * 10) / 10) : 0,
     tiles: room.tiles.map((t) => t.s).join(''),
-    holder: room.game === 'bomb' ? room.bomb.holder : 0,
-    fuse: room.game === 'bomb' ? Math.max(0, Math.round(room.bomb.fuse * 10) / 10) : 0,
+    holder: g === 'bomb' ? room.bomb.holder : 0,
+    fuse: g === 'bomb' ? Math.max(0, Math.round(room.bomb.fuse * 10) / 10) : 0,
     pickups: room.pickups.map((k) => ({ id: k.id, ty: k.type, x: +k.x.toFixed(2), z: +k.z.toFixed(2) })),
     proj: room.proj.map((b) => ({ id: b.id, x: +b.x.toFixed(2), z: +b.z.toFixed(2) })),
     bombs: room.bombs.map((b) => ({ id: b.id, x: +b.x.toFixed(2), z: +b.z.toFixed(2), t: +b.t.toFixed(2) })),
     fx: room.fx.map((f) => ({ id: f.id, k: f.k, x: +f.x.toFixed(2), z: +f.z.toFixed(2) })),
+    meteors: room.meteors.map((m) => ({ id: m.id, x: +m.x.toFixed(2), z: +m.z.toFixed(2), p: +(m.t / m.dur).toFixed(2) })),
+    zombies: room.zombies.map((z) => ({ id: z.id, x: +z.x.toFixed(2), z: +z.z.toFixed(2), ry: +z.ry.toFixed(2) })),
+    hill: g === 'hill' ? { x: room.hill.x, z: room.hill.z, r: HILL_R, own: room.hill.owner, con: room.hill.contested } : null,
+    vortex: g === 'disasters' && room.dis.kind === 'tornado' ? { x: +room.dis.vx.toFixed(2), z: +room.dis.vz.toFixed(2) } : null,
+    dis: g === 'disasters' ? room.dis.kind : '',
+    music: g === 'chairs' && room.phase === 'play' && room.mc.phase === 'music',
     players: players.map((p) => ({
-      id: p.id, name: p.name, color: p.color, score: p.score, gain: p.gain,
+      id: p.id, name: p.name, color: p.color, score: p.score, gain: p.gain, cg: p.coins, ht: Math.round(p.ht * 10) / 10,
       x: +p.x.toFixed(2), y: +p.y.toFixed(2), z: +p.z.toFixed(2), ry: +p.ry.toFixed(2),
       alive: p.alive, dm: p.dm, act: p.actFx > 0, hit: p.hitFx > 0,
       hp: p.hp, mhp: room.settings.hp, w: p.weapon, ammo: p.ammo,
@@ -592,7 +905,7 @@ function lobbyInfo(room) {
     phase: room.phase,
     settings: room.settings,
     palette: COLORS,
-    players: playersOf(room).map((p) => ({ id: p.id, name: p.name, color: p.color })),
+    players: playersOf(room).map((p) => ({ id: p.id, name: p.name, color: p.color, cos: p.cos })),
   };
 }
 
@@ -601,12 +914,12 @@ function broadcast(room, msg) {
   room.clients.forEach((c) => { if (c.ws.readyState === 1) c.ws.send(data); });
 }
 
-function addPlayer(room, ws, name) {
+function addPlayer(room, ws, name, cos) {
   const used = new Set(playersOf(room).map((p) => p.color));
   const color = COLORS.find((c) => !used.has(c)) || COLORS[0];
   const id = room.nextId++;
   const p = {
-    id, name: (name || 'Player').toString().slice(0, 12) || 'Player', color, score: 0, gain: 0,
+    id, name: cleanText(name, 12, 'Player'), color, cos: cleanCos(cos), score: 0, gain: 0, coins: 0, ht: 0, respawn: 0,
     x: 0, y: 0, z: 0, vx: 0, vz: 0, kx: 0, kz: 0, vy: 0, ix: 0, iz: 0, ry: 0,
     alive: true, falling: false, dm: 0, shoveCd: 0, actFx: 0, useCd: 0, passCd: 0, hitFx: 0, rank: 0,
     kills: 0, hp: 3, weapon: '', ammo: 0, lastHitBy: 0, lastHitT: -99,
@@ -638,14 +951,16 @@ wss.on('connection', (ws) => {
     const room = ws.room;
     if (m.t === 'create' && !room) {
       const r = newRoom(makeCode());
+      const nm = cleanText(m.name, 12, 'Player');
+      applySettings(r.settings, { roomName: cleanText(m.roomName, 24, nm + "'s room"), isPublic: m.isPublic !== false });
       rooms.set(r.code, r);
-      addPlayer(r, ws, m.name);
+      addPlayer(r, ws, nm, m.cos);
     } else if (m.t === 'join' && !room) {
       const r = rooms.get(String(m.code || '').toUpperCase().trim());
       if (!r) return ws.send(JSON.stringify({ t: 'error', msg: 'Room not found' }));
       if (r.phase !== 'lobby') return ws.send(JSON.stringify({ t: 'error', msg: 'Game already in progress' }));
       if (r.clients.size >= MAX_PLAYERS) return ws.send(JSON.stringify({ t: 'error', msg: 'Room is full (max 4)' }));
-      addPlayer(r, ws, m.name);
+      addPlayer(r, ws, m.name, m.cos);
     } else if (room) {
       const c = room.clients.get(ws.pid);
       if (!c) return;
@@ -665,6 +980,9 @@ wss.on('connection', (ws) => {
           c.p.color = m.c;
           broadcast(room, lobbyInfo(room));
         }
+      } else if (m.t === 'cos' && room.phase === 'lobby') {
+        c.p.cos = cleanCos(m.cos);
+        broadcast(room, lobbyInfo(room));
       } else if (m.t === 'kick' && isHost && room.phase === 'lobby') {
         const target = room.clients.get(+m.id);
         if (target && +m.id !== ws.pid) {
