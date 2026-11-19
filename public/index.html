@@ -141,7 +141,7 @@ const HINTS = {
 const WEAPON_NAMES = { blaster: 'Blaster', hammer: 'Hammer', grenade: 'Grenade' };
 
 // ---------- personal settings (saved in this browser) ----------
-const local = { shadows: true, camera: 'normal', tags: true };
+const local = { shadows: true, camera: 'normal', tags: true, sound: true, volume: 'normal' };
 try { Object.assign(local, JSON.parse(localStorage.getItem('ffp-settings') || '{}')); } catch (e) { /* ignore */ }
 const saveLocal = () => { try { localStorage.setItem('ffp-settings', JSON.stringify(local)); } catch (e) { /* ignore */ } };
 
@@ -176,7 +176,79 @@ function placeCamera() {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
 }
+// ---------- sound (all synthesised in the browser, no audio files) ----------
+let actx = null, master = null, noiseBuf = null;
+const VOLUMES = { low: 0.25, normal: 0.55, high: 1 };
+function applyVolume() { if (master) master.gain.value = local.sound ? (VOLUMES[local.volume] || 0.55) : 0; }
+function initAudio() {
+  try {
+    if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    master = actx.createGain(); master.connect(actx.destination);
+    noiseBuf = actx.createBuffer(1, actx.sampleRate, actx.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    applyVolume();
+  } catch (e) { actx = null; }
+}
+addEventListener('pointerdown', initAudio);
+addEventListener('keydown', initAudio);
+
+function tone(freq, dur, o = {}) {
+  if (!actx) return;
+  const { type = 'square', vol = 0.3, slide = 0, delay = 0 } = o;
+  const t = actx.currentTime + delay;
+  const osc = actx.createOscillator(), g = actx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t);
+  if (slide) osc.frequency.exponentialRampToValueAtTime(Math.max(20, freq * slide), t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  osc.connect(g); g.connect(master);
+  osc.start(t); osc.stop(t + dur + 0.03);
+}
+function noise(dur, o = {}) {
+  if (!actx) return;
+  const { vol = 0.4, hp = 0, lp = 8000, delay = 0 } = o;
+  const t = actx.currentTime + delay;
+  const src = actx.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+  const lo = actx.createBiquadFilter(); lo.type = 'lowpass'; lo.frequency.value = lp;
+  const g = actx.createGain();
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  let node = src;
+  if (hp) { const h = actx.createBiquadFilter(); h.type = 'highpass'; h.frequency.value = hp; node.connect(h); node = h; }
+  node.connect(lo); lo.connect(g); g.connect(master);
+  src.start(t); src.stop(t + dur + 0.03);
+}
+const gates = {};
+function gate(name, gap) { const n = performance.now(); if (gates[name] && n - gates[name] < gap) return false; gates[name] = n; return true; }
+const sfx = {
+  beep() { tone(660, 0.16, { vol: 0.25 }); },
+  go() { tone(990, 0.35, { vol: 0.28 }); tone(1320, 0.35, { vol: 0.18, delay: 0.05 }); },
+  shove() { noise(0.14, { vol: 0.35, hp: 500, lp: 3500 }); tone(190, 0.12, { type: 'sine', slide: 0.5, vol: 0.3 }); },
+  swing() { noise(0.22, { vol: 0.4, hp: 300, lp: 2500 }); },
+  pew() { tone(1300, 0.16, { type: 'sawtooth', slide: 0.2, vol: 0.22 }); },
+  whack() { noise(0.09, { vol: 0.5, lp: 1600 }); tone(130, 0.14, { type: 'sine', slide: 0.5, vol: 0.5 }); },
+  thunk() { tone(240, 0.1, { type: 'triangle', slide: 0.6, vol: 0.4 }); },
+  boom() { noise(0.55, { vol: 0.8, lp: 900 }); tone(95, 0.55, { type: 'sine', slide: 0.3, vol: 0.7 }); },
+  pickup() { tone(660, 0.09, { vol: 0.2 }); tone(990, 0.13, { vol: 0.2, delay: 0.07 }); },
+  crack() { noise(0.05, { vol: 0.22, hp: 2000, lp: 6000 }); },
+  tileFall() { noise(0.3, { vol: 0.22, lp: 600 }); },
+  warn() { tone(880, 0.08, { vol: 0.14 }); },
+  slam() { noise(0.28, { vol: 0.6, lp: 500 }); tone(70, 0.28, { type: 'sine', slide: 0.5, vol: 0.7 }); },
+  fall() { tone(700, 0.7, { type: 'sine', slide: 0.12, vol: 0.3 }); },
+  splat() { noise(0.16, { vol: 0.6, lp: 1200 }); tone(100, 0.16, { type: 'sine', slide: 0.4, vol: 0.6 }); },
+  zap() { tone(1500, 0.26, { type: 'sawtooth', slide: 0.1, vol: 0.28 }); noise(0.2, { vol: 0.3, hp: 3000 }); },
+  tick(urgent) { tone(urgent ? 950 : 620, 0.05, { vol: 0.22 }); },
+  pass() { tone(500, 0.07, { vol: 0.25 }); tone(820, 0.1, { vol: 0.25, delay: 0.06 }); },
+  win() { [523, 659, 784, 1046].forEach((f, i) => tone(f, 0.22, { type: 'triangle', vol: 0.35, delay: i * 0.11 })); },
+  nobody() { tone(220, 0.45, { type: 'sawtooth', slide: 0.5, vol: 0.22 }); },
+  fanfare() { [523, 523, 523, 784, 659, 784, 1046].forEach((f, i) => tone(f, 0.28, { type: 'square', vol: 0.22, delay: i * 0.14 })); },
+};
+
 function applyLocal() {
+  applyVolume();
   sun.castShadow = !!local.shadows;
   placeCamera();
   $('tags').style.display = local.tags ? '' : 'none';
@@ -406,6 +478,8 @@ const LOCAL_UI = [
   { k: 'shadows', label: 'Shadows', opts: [['true', 'On'], ['false', 'Off (faster)']] },
   { k: 'camera', label: 'Camera distance', opts: [['close', 'Close'], ['normal', 'Normal'], ['far', 'Far']] },
   { k: 'tags', label: 'Name tags', opts: [['true', 'On'], ['false', 'Off']] },
+  { k: 'sound', label: 'Sound', opts: [['true', 'On'], ['false', 'Off']] },
+  { k: 'volume', label: 'Volume', opts: [['low', 'Low'], ['normal', 'Normal'], ['high', 'High']] },
 ];
 function buildLocal(box) {
   LOCAL_UI.forEach((f) => {
@@ -415,7 +489,8 @@ function buildLocal(box) {
   });
   box.addEventListener('change', (e) => {
     const k = e.target.dataset.lk; if (!k) return;
-    local[k] = k === 'camera' ? e.target.value : e.target.value === 'true';
+    local[k] = (k === 'camera' || k === 'volume') ? e.target.value : e.target.value === 'true';
+    if (k === 'sound' || k === 'volume') { initAudio(); if (local.sound) sfx.beep(); }
     saveLocal(); applyLocal(); syncLocalUI();
   });
 }
