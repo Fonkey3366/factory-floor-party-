@@ -1,5 +1,6 @@
 // Party game server: static files + server list + WebSocket rooms + minigame simulation.
 const http = require('http');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
@@ -20,7 +21,7 @@ const S = 2;              // tile size
 const HALF = (N * S) / 2; // arena half-size
 const TICK = 1 / 30;
 const RADIUS = 0.55;
-const MAX_PLAYERS = 4;
+const MAX_PLAYERS = 8;
 const COLORS = ['#ff5a36', '#35c9ff', '#9be22e', '#ffd21f', '#c06bff', '#ff6bb5', '#ffffff', '#2fe0b0'];
 const GAMES = {
   crumble: 'Crumbling Floor',
@@ -32,6 +33,18 @@ const GAMES = {
   hill: 'King of the Hill',
   zombies: 'Zombie Survival',
   chairs: 'Musical Chairs',
+  conveyor_roulette: 'Conveyor Roulette',
+  express_train: 'Express Train',
+  press_memory: 'Press Memory',
+};
+const CHAOS = ['low_gravity', 'slippery_oil', 'double_hazard', 'sudden_death', 'tiny_arena', 'heavy_bots'];
+const DURATIONS = [60, 90, 120, 180];
+const PRIVACY = ['public', 'code', 'password'];
+// per-mode tunables: allowed values and defaults
+const MODE_OPTS = {
+  conveyor_roulette: { beltSpeed: { o: ['slow', 'normal', 'fast'], d: 'normal' }, reverseEvery: { o: [4, 6, 8], d: 6 }, ramp: { o: [true, false], d: true } },
+  express_train: { warning: { o: [2, 3, 4], d: 3 }, safeRatio: { o: ['tight', 'normal', 'loose'], d: 'normal' }, trainSpeed: { o: ['slow', 'normal', 'fast'], d: 'normal' }, bothAxes: { o: [true, false], d: true } },
+  press_memory: { startLength: { o: [1, 2, 3, 4, 5], d: 2 }, showSpeed: { o: ['slow', 'normal', 'fast'], d: 'normal' }, symbols: { o: [4, 6], d: 4 } },
 };
 const TIMED = { hill: 45, zombies: 40 }; // seconds, these modes end on a timer
 const HILL_R = 2.6;
@@ -43,30 +56,37 @@ const DISASTERS = ['earthquake', 'flood', 'tornado', 'lightning'];
 const DIS_DUR = { earthquake: 6, flood: 8, tornado: 8, lightning: 7 };
 const DIS_NAMES = { earthquake: 'EARTHQUAKE!', flood: 'FLOOD! The edges are going under', tornado: 'TORNADO! Stay away from the vortex', lightning: 'LIGHTNING STORM!' };
 // cosmetics: the server only checks that ids exist (ownership is stored in each player's browser)
-const HATS = ['cone', 'horns', 'prop', 'tophat', 'halo', 'crown'];
-const VISORS = ['cyan', 'pink', 'gold', 'rainbow'];
-const TRAILS = ['sparks', 'bubbles', 'hearts'];
+const COS = {
+  paint: ['hazard_stripes', 'rusted_scrap', 'cardboard_box', 'chrome_prototype', 'gold_plated'],
+  head: ['hardhat', 'traffic_cone', 'propeller', 'siren_light', 'crt_head', 'tophat', 'horns', 'halo', 'crown'],
+  trail: ['black_smoke', 'weld_sparks', 'oil_drip', 'neon_coolant', 'sparks', 'bubbles', 'hearts'],
+  emote: ['gear_flex', 'short_circuit', 'confetti_bolt', 'boot_up_dance'],
+};
+const EMOTE_TIME = 2.4;
 
 const cleanText = (v, max, d) => {
   const t = String(v == null ? '' : v).replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, max);
   return t || d;
 };
 function cleanCos(c) {
-  const o = { hat: '', visor: '', trail: '' };
-  if (c && typeof c === 'object') {
-    if (HATS.includes(c.hat)) o.hat = c.hat;
-    if (VISORS.includes(c.visor)) o.visor = c.visor;
-    if (TRAILS.includes(c.trail)) o.trail = c.trail;
-  }
+  const o = { paint: '', head: '', trail: '', emote: 'gear_flex' };
+  if (c && typeof c === 'object') for (const k of Object.keys(COS)) if (COS[k].includes(c[k])) o[k] = c[k];
   return o;
 }
 
 function defaultSettings() {
   return {
     roomName: 'Party room',
-    isPublic: true,
+    privacy: 'public',
+    maxPlayers: 8,
+    matchType: 'rounds',
     rounds: 5,
+    roundsToWin: 3,
+    roundDuration: 90,
     modes: Object.fromEntries(Object.keys(GAMES).map((g) => [g, true])),
+    chaos: [],
+    chaosRandom: 'off',
+    modeOpts: Object.fromEntries(Object.entries(MODE_OPTS).map(([m, t]) => [m, Object.fromEntries(Object.entries(t).map(([k, v]) => [k, v.d]))])),
     order: 'random',
     hp: 3,
     speed: 'normal',
@@ -84,7 +104,21 @@ function applySettings(s, inc) {
   const int = (v, lo, hi, d) => { v = Math.round(+v); return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : d; };
   const pick = (v, table, d) => (typeof v === 'string' && Object.hasOwn(table, v) ? v : d);
   if (typeof inc.roomName === 'string') s.roomName = cleanText(inc.roomName, 24, s.roomName);
-  if (typeof inc.isPublic === 'boolean') s.isPublic = inc.isPublic;
+  if (typeof inc.isPublic === 'boolean') s.privacy = inc.isPublic ? 'public' : 'code';
+  if (PRIVACY.includes(inc.privacy)) s.privacy = inc.privacy;
+  s.maxPlayers = int(inc.maxPlayers, 2, MAX_PLAYERS, s.maxPlayers);
+  s.roundsToWin = int(inc.roundsToWin, 1, 7, s.roundsToWin);
+  if (DURATIONS.includes(+inc.roundDuration)) s.roundDuration = +inc.roundDuration;
+  if (inc.matchType === 'rounds' || inc.matchType === 'firstTo') s.matchType = inc.matchType;
+  if (inc.chaosRandom === 'off' || inc.chaosRandom === 'one_per_round') s.chaosRandom = inc.chaosRandom;
+  if (Array.isArray(inc.chaos)) s.chaos = CHAOS.filter((c) => inc.chaos.includes(c));
+  if (inc.modeOpts && typeof inc.modeOpts === 'object') {
+    for (const [m, tbl] of Object.entries(MODE_OPTS)) {
+      const src = inc.modeOpts[m];
+      if (!src || typeof src !== 'object') continue;
+      for (const [k, def] of Object.entries(tbl)) if (def.o.includes(src[k])) s.modeOpts[m][k] = src[k];
+    }
+  }
   s.rounds = int(inc.rounds, 1, 12, s.rounds);
   s.hp = int(inc.hp, 1, 5, s.hp);
   s.winBonus = int(inc.winBonus, 0, 5, s.winBonus);
@@ -109,12 +143,13 @@ function shuffle(a) {
 function buildPlan(s) {
   const enabled = Object.keys(GAMES).filter((g) => s.modes[g]);
   const plan = [];
+  const total = s.matchType === 'firstTo' ? 40 : s.rounds;
   if (s.order === 'fixed') {
-    for (let i = 0; i < s.rounds; i++) plan.push(enabled[i % enabled.length]);
+    for (let i = 0; i < total; i++) plan.push(enabled[i % enabled.length]);
     return plan;
   }
   let bag = [];
-  while (plan.length < s.rounds) {
+  while (plan.length < total) {
     if (!bag.length) {
       bag = shuffle(enabled.slice());
       if (plan.length && bag.length > 1 && bag[0] === plan[plan.length - 1]) bag.push(bag.shift());
@@ -130,11 +165,11 @@ const rooms = new Map();
 const server = http.createServer((req, res) => {
   const url = decodeURIComponent(req.url.split('?')[0]);
   if (url === '/api/rooms') {
-    const list = [...rooms.values()].filter((r) => r.settings.isPublic).map((r) => {
+    const list = [...rooms.values()].filter((r) => r.settings.privacy === 'public').map((r) => {
       const host = r.clients.get(r.hostId);
       return {
         code: r.code, name: r.settings.roomName, host: host ? host.p.name : '',
-        players: r.clients.size, max: MAX_PLAYERS, phase: r.phase,
+        players: r.clients.size, max: r.settings.maxPlayers, phase: r.phase,
         round: r.round + 1, rounds: r.plan.length || r.settings.rounds,
       };
     });
@@ -157,6 +192,8 @@ const server = http.createServer((req, res) => {
     res.end(data);
   });
 });
+
+const hashPw = (room, pw) => crypto.createHash('sha256').update(room.code + ':' + String(pw).slice(0, 16)).digest('hex');
 
 function makeCode() {
   const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -230,6 +267,7 @@ function newRoom(code) {
     floodRing: 0,
     hill: { x: 0, z: 0, t: 12, owner: 0, contested: false },
     mc: { phase: 'music', t: 5, chairs: [], wave: 0 },
+    cv: null, tr: null, pm: null, chaos: new Set(), sd: null, pw: '',
     info: '',
     startCount: 0,
   };
@@ -262,6 +300,10 @@ function spawnZombie(room) {
   room.zombies.push({ id: room.eid++, x, z, kx: 0, kz: 0, ry: 0 });
 }
 
+const cz = (room, id) => room.chaos && room.chaos.has(id);
+const ringOf = (i) => Math.max(Math.abs((i % N) - 4), Math.abs(Math.floor(i / N) - 4));
+const timedLen = (room) => (TIMED[room.game] ? Math.round((TIMED[room.game] * room.settings.roundDuration) / 90) : room.settings.roundDuration);
+
 function startRound(room) {
   room.game = room.plan[room.round];
   room.phase = 'countdown';
@@ -279,15 +321,30 @@ function startRound(room) {
   room.hill = { x: 0, z: 0, t: 12, owner: 0, contested: false };
   room.mc = { phase: 'music', t: 4 + Math.random() * 3, chairs: [], wave: 0 };
   resetTiles(room);
+  const st = room.settings;
+  room.chaos = new Set(st.chaos);
+  if (st.chaosRandom === 'one_per_round') {
+    const pool = CHAOS.filter((c) => !room.chaos.has(c));
+    if (pool.length) room.chaos.add(pool[Math.floor(Math.random() * pool.length)]);
+  }
+  const tiny = cz(room, 'tiny_arena') && !['hill', 'zombies', 'chairs'].includes(room.game);
+  if (tiny) room.tiles.forEach((t, i) => { if (ringOf(i) >= 3) t.s = 2; });
+  room.sd = cz(room, 'sudden_death') ? { at: 20 + Math.random() * 25, ring: 4, t: 0 } : null;
+  const co = st.modeOpts.conveyor_roulette;
+  room.cv = { rows: Array.from({ length: N }, (_, i) => (i % 2 ? 1 : -1)), cols: Array.from({ length: N }, (_, i) => (i % 2 ? -1 : 1)), w: null, t: co.reverseEvery, spd: 0 };
+  room.tr = { ph: 'idle', t: 2, wave: 0, pads: [], ax: 'x', dir: 1, u: 0, dur: 1.4, w0: 3 };
+  room.pm = { ph: 'start', t: 1.5, wave: 0, seq: [], i: 0, on: false, cur: -1, ask: 0, ans: 0, hit: [] };
   const list = playersOf(room);
   room.startCount = list.length;
+  const spawnR = tiny ? 3 : 5;
   list.forEach((p, i) => {
     const a = (i / list.length) * Math.PI * 2 + 0.4;
-    p.x = Math.cos(a) * 5; p.z = Math.sin(a) * 5; p.y = 0;
+    p.x = Math.cos(a) * spawnR; p.z = Math.sin(a) * spawnR; p.y = 0;
     p.vx = p.vz = p.kx = p.kz = p.vy = 0;
     p.ix = p.iz = 0;
     p.alive = true; p.falling = false; p.dm = 0;
     p.shoveCd = 0; p.actFx = 0; p.useCd = 0; p.passCd = 0; p.hitFx = 0;
+    p.em = ''; p.emT = 0; p.emCd = 0;
     p.rank = 0; p.kills = 0; p.gain = 0; p.coins = 0; p.ht = 0; p.respawn = 0;
     p.hp = room.settings.hp; p.weapon = ''; p.ammo = 0;
     p.lastHitBy = 0; p.lastHitT = -99;
@@ -324,6 +381,7 @@ function knock(room, victim, fromX, fromZ, force, attacker) {
   let dx = victim.x - fromX, dz = victim.z - fromZ;
   const d = Math.hypot(dx, dz) || 1;
   dx /= d; dz /= d;
+  force *= (cz(room, 'heavy_bots') ? 0.5 : 1) * (cz(room, 'low_gravity') ? 1.6 : 1);
   victim.kx += dx * force; victim.kz += dz * force;
   if (attacker) { victim.lastHitBy = attacker.id; victim.lastHitT = room.elapsed; }
 }
@@ -350,7 +408,8 @@ function finishRound(room, players) {
     alive.forEach((p) => { p.rank = n; });
     if (alive.length === 1 && n > 1) winner = alive[0];
   }
-  const last = room.round === room.plan.length - 1;
+  if (winner) winner.wins++;
+  const last = s.matchType === 'firstTo' ? players.some((q) => q.wins >= s.roundsToWin) : room.round === room.plan.length - 1;
   const mult = last ? s.finalMult : 1;
   players.forEach((p) => {
     let g = 0;
@@ -367,6 +426,7 @@ function finishRound(room, players) {
     if (c.ws.readyState === 1) c.ws.send(JSON.stringify({ t: 'coins', n: c.p.coins }));
   });
   room.winnerId = winner ? winner.id : null;
+  if (winner) { winner.em = winner.cos.emote || 'gear_flex'; winner.emT = EMOTE_TIME; }
   room.phase = 'roundEnd';
   room.timer = 4;
 }
@@ -396,14 +456,17 @@ function update(room) {
     const alive = players.filter((p) => p.alive);
     const limit = room.startCount > 1 ? 1 : 0;
     let over;
-    if (room.game === 'hill') over = room.elapsed >= TIMED.hill;
-    else over = alive.length <= limit || room.elapsed > (TIMED[room.game] || 90);
+    const cap = timedLen(room);
+    if (room.game === 'hill') over = room.elapsed >= cap;
+    else over = alive.length <= limit || room.elapsed > cap;
     if (over) finishRound(room, players);
   } else if (room.phase === 'roundEnd') {
     room.timer -= dt;
     if (room.timer <= 0) {
       room.round++;
-      if (room.round >= room.plan.length) { room.phase = 'final'; room.timer = 10; }
+      const st = room.settings;
+      const done = st.matchType === 'firstTo' ? players.some((q) => q.wins >= st.roundsToWin) : false;
+      if (done || room.round >= room.plan.length) { room.phase = 'final'; room.timer = 10; }
       else startRound(room);
     }
   } else if (room.phase === 'final') {
@@ -418,20 +481,22 @@ function toLobby(room) {
   room.game = null;
   room.pickups = []; room.proj = []; room.bombs = []; room.fx = []; room.meteors = []; room.zombies = [];
   room.clients.forEach((c) => {
-    Object.assign(c.p, { score: 0, alive: true, falling: false, dm: 0, y: 0, gain: 0, coins: 0, ht: 0, weapon: '', ammo: 0, respawn: 0 });
+    Object.assign(c.p, { score: 0, wins: 0, em: '', emT: 0, alive: true, falling: false, dm: 0, y: 0, gain: 0, coins: 0, ht: 0, weapon: '', ammo: 0, respawn: 0 });
   });
   resetTiles(room);
   broadcast(room, lobbyInfo(room));
 }
 
 function movePlayers(room, players, dt, active) {
-  const baseSpeed = SPEEDS[room.settings.speed];
+  const baseSpeed = SPEEDS[room.settings.speed] * (cz(room, 'heavy_bots') ? 0.85 : 1);
+  const slip = cz(room, 'slippery_oil'), lowg = cz(room, 'low_gravity');
   for (const p of players) {
     p.shoveCd = Math.max(0, p.shoveCd - dt);
     p.actFx = Math.max(0, p.actFx - dt);
     p.useCd = Math.max(0, p.useCd - dt);
     p.passCd = Math.max(0, p.passCd - dt);
     p.hitFx = Math.max(0, p.hitFx - dt);
+    p.emT = Math.max(0, p.emT - dt); p.emCd = Math.max(0, p.emCd - dt);
     if (!p.alive && !p.falling) continue;
     if (p.falling) {
       if (p.respawn > 0) { // King of the Hill: come back after a short wait
@@ -443,7 +508,7 @@ function movePlayers(room, players, dt, active) {
         }
         continue;
       }
-      p.vy -= 28 * dt;
+      p.vy -= 28 * dt * (lowg ? 0.5 : 1);
       p.y += p.vy * dt;
       p.x += (p.vx + p.kx) * dt;
       p.z += (p.vz + p.kz) * dt;
@@ -458,11 +523,12 @@ function movePlayers(room, players, dt, active) {
     if (!active) { ix = 0; iz = 0; }
     let speed = baseSpeed;
     if (room.game === 'bomb' && room.bomb.holder === p.id) speed *= 1.12;
-    p.vx += (ix * speed - p.vx) * Math.min(1, dt * 12);
-    p.vz += (iz * speed - p.vz) * Math.min(1, dt * 12);
+    const accel = slip ? 3 : 12;
+    p.vx += (ix * speed - p.vx) * Math.min(1, dt * accel);
+    p.vz += (iz * speed - p.vz) * Math.min(1, dt * accel);
     p.x += (p.vx + p.kx) * dt;
     p.z += (p.vz + p.kz) * dt;
-    const decay = Math.exp(-4.5 * dt);
+    const decay = Math.exp(-(slip ? 1.8 : lowg ? 2.8 : 4.5) * dt);
     p.kx *= decay; p.kz *= decay;
     if (Math.hypot(ix, iz) > 0.2) p.ry = Math.atan2(ix, iz);
   }
@@ -495,7 +561,7 @@ function movePlayers(room, players, dt, active) {
 
 function updateHazards(room, players, dt) {
   const tiles = room.tiles;
-  const rate = HAZ[room.settings.hazards];
+  const rate = HAZ[room.settings.hazards] * (cz(room, 'double_hazard') ? 2 : 1);
   const live = players.filter((p) => p.alive && !p.falling);
 
   // cracking tiles fall away (every mode except Crumbling Floor, which has its own handling)
@@ -561,6 +627,141 @@ function updateHazards(room, players, dt) {
   if (room.game === 'hill') updateHill(room, players, live, dt);
   if (room.game === 'zombies') updateZombies(room, players, live, dt, rate);
   if (room.game === 'chairs') updateChairs(room, players, live, dt);
+  if (room.game === 'conveyor_roulette') updateConveyor(room, players, live, dt, rate);
+  if (room.game === 'express_train') updateTrain(room, players, live, dt, rate);
+  if (room.game === 'press_memory') updateMemory(room, players, live, dt);
+
+  if (room.sd && room.elapsed >= room.sd.at) {
+    room.sd.t -= dt;
+    if (room.sd.t <= 0 && room.sd.ring >= 1) {
+      tiles.forEach((t, i) => { if (ringOf(i) === room.sd.ring && t.s === 0) { t.s = 1; t.t = 0.8; } });
+      room.sd.ring--; room.sd.t = 6 / Math.sqrt(rate);
+    }
+    if (!room.info) room.info = 'SUDDEN DEATH - the edges are crumbling!';
+  }
+}
+
+// Conveyor Roulette: every row and column is a belt that periodically reverses
+function updateConveyor(room, players, live, dt, rate) {
+  const o = room.settings.modeOpts.conveyor_roulette, cv = room.cv, tiles = room.tiles;
+  const base = { slow: 1.5, normal: 2.4, fast: 3.6 }[o.beltSpeed];
+  cv.spd = base * (o.ramp ? 1 + 0.1 * Math.floor(room.elapsed / 20) : 1) * Math.sqrt(rate);
+  for (const p of live) {
+    const ti = tileUnder(p.x, p.z);
+    if (ti < 0 || tiles[ti].s === 2) continue;
+    p.x += cv.rows[Math.floor(ti / N)] * cv.spd * dt;
+    p.z += cv.cols[ti % N] * cv.spd * dt;
+  }
+  cv.t -= dt;
+  if (!cv.w && cv.t <= 0) cv.w = { a: Math.random() < 0.5 ? 'r' : 'c', i: Math.floor(Math.random() * N), t: 1.0 };
+  if (cv.w) {
+    room.info = 'A belt is about to reverse!';
+    cv.w.t -= dt;
+    if (cv.w.t <= 0) {
+      const arr = cv.w.a === 'r' ? cv.rows : cv.cols;
+      arr[cv.w.i] *= -1;
+      cv.w = null; cv.t = o.reverseEvery;
+    }
+  }
+}
+
+// Express Train: lit pads are the only safe spots when the train sweeps the arena
+function updateTrain(room, players, live, dt, rate) {
+  const o = room.settings.modeOpts.express_train, tr = room.tr, tiles = room.tiles;
+  tr.t -= dt;
+  if (tr.ph === 'idle') {
+    room.info = 'Train incoming...';
+    if (tr.t <= 0) {
+      const k = { tight: -2, normal: -1, loose: 0 }[o.safeRatio];
+      const count = Math.max(1, Math.min(live.length + k, 12));
+      const cand = shuffle(tiles.map((t, i) => (t.s === 0 ? i : -1)).filter((i) => i >= 0));
+      tr.pads = cand.slice(0, count);
+      tr.pads.forEach((i) => { tiles[i].s = 9; });
+      tr.ax = o.bothAxes && Math.random() < 0.5 ? 'z' : 'x';
+      tr.dir = Math.random() < 0.5 ? 1 : -1;
+      tr.ph = 'warn'; tr.t = Math.max(1.6, o.warning - tr.wave * 0.12); tr.w0 = tr.t;
+    }
+  } else if (tr.ph === 'warn') {
+    room.info = `TRAIN IN ${Math.max(1, Math.ceil(tr.t))}s - get on a green pad!`;
+    if (tr.t <= 0) {
+      tr.ph = 'pass';
+      tr.dur = { slow: 1.9, normal: 1.4, fast: 1.0 }[o.trainSpeed] / Math.min(rate, 1.5);
+      tr.t = tr.dur;
+    }
+  } else if (tr.ph === 'pass') {
+    const prog = 1 - Math.max(0, tr.t) / tr.dur;
+    tr.u = tr.dir * (-HALF - 3 + prog * (2 * HALF + 6));
+    const pads = tr.pads.map(tileCenter);
+    for (const p of live) {
+      if (!p.alive || p.falling) continue;
+      const a = tr.ax === 'x' ? p.x : p.z;
+      if (Math.abs(a - tr.u) > 1.3) continue;
+      if (pads.some((c) => Math.hypot(p.x - c.x, p.z - c.z) < 0.6)) continue;
+      eliminate(room, p, 1);
+    }
+    if (tr.t <= 0) {
+      tr.pads.forEach((i) => { if (tiles[i].s === 9) tiles[i].s = 0; });
+      tr.pads = []; tr.ph = 'idle'; tr.t = 1.3; tr.wave++;
+    }
+  }
+}
+
+// Press Memory: watch the sequence, remember a position in it, stand on that zone
+const zoneOf = (i, n) => {
+  const tx = i % N, tz = Math.floor(i / N);
+  if (n === 4) return (tx <= 4 ? 0 : 1) + (tz <= 4 ? 0 : 2);
+  return (tx < 3 ? 0 : tx < 6 ? 1 : 2) + (tz <= 4 ? 0 : 3);
+};
+const ORD = ['1st', '2nd', '3rd', '4th', '5th', '6th', '7th', '8th'];
+function updateMemory(room, players, live, dt) {
+  const o = room.settings.modeOpts.press_memory, pm = room.pm, tiles = room.tiles, n = o.symbols;
+  pm.t -= dt;
+  const on = { slow: 1.0, normal: 0.7, fast: 0.45 }[o.showSpeed];
+  if (pm.ph === 'start') {
+    room.info = 'Get ready...';
+    if (pm.t <= 0) {
+      const len = Math.min(8, o.startLength + pm.wave);
+      pm.seq = Array.from({ length: len }, () => Math.floor(Math.random() * n));
+      pm.i = 0; pm.on = true; pm.cur = pm.seq[0]; pm.ph = 'show'; pm.t = on;
+    }
+  } else if (pm.ph === 'show') {
+    room.info = `Memorise the symbols! (${pm.i + 1}/${pm.seq.length})`;
+    if (pm.t <= 0) {
+      if (pm.on) { pm.on = false; pm.cur = -1; pm.t = 0.25; }
+      else if (pm.i + 1 < pm.seq.length) { pm.i++; pm.on = true; pm.cur = pm.seq[pm.i]; pm.t = on; }
+      else {
+        pm.ask = Math.floor(Math.random() * pm.seq.length);
+        pm.ans = pm.seq[pm.ask];
+        pm.ph = 'go'; pm.t = Math.max(2.8, 3.0 + pm.seq.length * 0.2 - pm.wave * 0.1);
+      }
+    }
+  } else if (pm.ph === 'go') {
+    const k = pm.seq.length;
+    const which = k === 1 ? 'the symbol' : pm.ask === k - 1 ? 'the LAST symbol' : `the ${ORD[pm.ask]} symbol`;
+    room.info = `Stand on ${which}!  ${Math.max(1, Math.ceil(pm.t))}s`;
+    if (pm.t <= 0) {
+      pm.hit = [];
+      tiles.forEach((t, i) => { if (t.s === 0 && zoneOf(i, n) !== pm.ans) { t.s = 3; pm.hit.push(i); } });
+      pm.ph = 'warn'; pm.t = 0.45;
+    }
+  } else if (pm.ph === 'warn') {
+    if (pm.t <= 0) {
+      pm.hit.forEach((i) => { tiles[i].s = 4; });
+      for (const p of live) {
+        const ti = tileAt(p.x, p.z);
+        if (ti >= 0 && tiles[ti].s === 4) eliminate(room, p, 1);
+      }
+      pm.ph = 'slam'; pm.t = 0.8;
+    }
+  } else if (pm.ph === 'slam') {
+    if (pm.t <= 0) {
+      pm.hit.forEach((i) => { if (tiles[i].s === 4) tiles[i].s = 0; });
+      pm.hit = []; pm.ph = 'rest'; pm.t = 1.2;
+    }
+  } else if (pm.ph === 'rest') {
+    room.info = 'Nice! Next round...';
+    if (pm.t <= 0) { pm.wave++; pm.ph = 'start'; pm.t = 0.8; }
+  }
 }
 
 function updateArmory(room, players, live, dt, rate) {
@@ -884,7 +1085,6 @@ function doAct(room, p) {
 function snapshot(room) {
   const players = playersOf(room);
   const g = room.game;
-  const timed = TIMED[g];
   return {
     t: 'state',
     phase: room.phase,
@@ -892,10 +1092,12 @@ function snapshot(room) {
     gameName: g ? GAMES[g] : '',
     timer: Math.round(room.timer * 10) / 10,
     round: room.round + 1,
-    rounds: room.plan.length || room.settings.rounds,
+    rounds: room.settings.matchType === 'firstTo' ? 0 : (room.plan.length || room.settings.rounds),
+    ft: room.settings.matchType === 'firstTo' ? room.settings.roundsToWin : 0,
+    chaos: [...room.chaos],
     winnerId: room.winnerId,
     info: room.info,
-    left: timed && room.phase === 'play' ? Math.max(0, Math.round((timed - room.elapsed) * 10) / 10) : 0,
+    left: room.phase === 'play' ? Math.max(0, Math.round(timedLen(room) - room.elapsed)) : 0,
     tiles: room.tiles.map((t) => t.s).join(''),
     holder: g === 'bomb' ? room.bomb.holder : 0,
     fuse: g === 'bomb' ? Math.max(0, Math.round(room.bomb.fuse * 10) / 10) : 0,
@@ -908,12 +1110,15 @@ function snapshot(room) {
     hill: g === 'hill' ? { x: room.hill.x, z: room.hill.z, r: HILL_R, own: room.hill.owner, con: room.hill.contested } : null,
     vortex: g === 'disasters' && room.dis.kind === 'tornado' ? { x: +room.dis.vx.toFixed(2), z: +room.dis.vz.toFixed(2) } : null,
     dis: g === 'disasters' ? room.dis.kind : '',
+    cv: g === 'conveyor_roulette' ? { r: room.cv.rows, c: room.cv.cols, spd: +room.cv.spd.toFixed(2), w: room.cv.w ? { a: room.cv.w.a, i: room.cv.w.i, t: +room.cv.w.t.toFixed(2) } : null } : null,
+    tr: g === 'express_train' ? { ph: room.tr.ph, ax: room.tr.ax, dir: room.tr.dir, u: +room.tr.u.toFixed(2), pads: room.tr.pads, t: +room.tr.t.toFixed(2) } : null,
+    pm: g === 'press_memory' ? { ph: room.pm.ph, cur: room.pm.cur, k: room.pm.seq.length, z: room.settings.modeOpts.press_memory.symbols, ask: ['go', 'warn', 'slam'].includes(room.pm.ph) ? room.pm.ask + 1 : 0 } : null,
     music: g === 'chairs' && room.phase === 'play' && room.mc.phase === 'music',
     players: players.map((p) => ({
       id: p.id, name: p.name, color: p.color, score: p.score, gain: p.gain, cg: p.coins, ht: Math.round(p.ht * 10) / 10,
       x: +p.x.toFixed(2), y: +p.y.toFixed(2), z: +p.z.toFixed(2), ry: +p.ry.toFixed(2),
       alive: p.alive, dm: p.dm, act: p.actFx > 0, hit: p.hitFx > 0,
-      hp: p.hp, mhp: room.settings.hp, w: p.weapon, ammo: p.ammo,
+      hp: p.hp, mhp: room.settings.hp, w: p.weapon, ammo: p.ammo, wins: p.wins, em: p.emT > 0 ? p.em : '',
     })),
   };
 }
@@ -924,7 +1129,7 @@ function lobbyInfo(room) {
     code: room.code,
     hostId: room.hostId,
     phase: room.phase,
-    settings: room.settings,
+    settings: { ...room.settings, hasPassword: !!room.pw },
     palette: COLORS,
     players: playersOf(room).map((p) => ({ id: p.id, name: p.name, color: p.color, cos: p.cos })),
   };
@@ -940,7 +1145,7 @@ function addPlayer(room, ws, name, cos) {
   const color = COLORS.find((c) => !used.has(c)) || COLORS[0];
   const id = room.nextId++;
   const p = {
-    id, name: cleanText(name, 12, 'Player'), color, cos: cleanCos(cos), score: 0, gain: 0, coins: 0, ht: 0, respawn: 0,
+    id, name: cleanText(name, 12, 'Player'), color, cos: cleanCos(cos), score: 0, wins: 0, em: '', emT: 0, emCd: 0, gain: 0, coins: 0, ht: 0, respawn: 0,
     x: 0, y: 0, z: 0, vx: 0, vz: 0, kx: 0, kz: 0, vy: 0, ix: 0, iz: 0, ry: 0,
     alive: true, falling: false, dm: 0, shoveCd: 0, actFx: 0, useCd: 0, passCd: 0, hitFx: 0, rank: 0,
     kills: 0, hp: 3, weapon: '', ammo: 0, lastHitBy: 0, lastHitT: -99,
@@ -973,14 +1178,17 @@ wss.on('connection', (ws) => {
     if (m.t === 'create' && !room) {
       const r = newRoom(makeCode());
       const nm = cleanText(m.name, 12, 'Player');
-      applySettings(r.settings, { roomName: cleanText(m.roomName, 24, nm + "'s room"), isPublic: m.isPublic !== false });
+      applySettings(r.settings, { roomName: cleanText(m.roomName, 24, nm + "'s room"), isPublic: m.isPublic !== false, privacy: m.privacy });
+      if (typeof m.password === 'string' && m.password) r.pw = hashPw(r, m.password);
+      if (r.settings.privacy === 'password' && !r.pw) r.settings.privacy = 'code';
       rooms.set(r.code, r);
       addPlayer(r, ws, nm, m.cos);
     } else if (m.t === 'join' && !room) {
       const r = rooms.get(String(m.code || '').toUpperCase().trim());
       if (!r) return ws.send(JSON.stringify({ t: 'error', msg: 'Room not found' }));
       if (r.phase !== 'lobby') return ws.send(JSON.stringify({ t: 'error', msg: 'Game already in progress' }));
-      if (r.clients.size >= MAX_PLAYERS) return ws.send(JSON.stringify({ t: 'error', msg: 'Room is full (max 4)' }));
+      if (r.clients.size >= r.settings.maxPlayers) return ws.send(JSON.stringify({ t: 'error', msg: `Room is full (max ${r.settings.maxPlayers})` }));
+      if (r.settings.privacy === 'password' && r.pw && hashPw(r, m.password) !== r.pw) return ws.send(JSON.stringify({ t: 'error', msg: m.password ? 'Wrong password' : 'This room needs a password' }));
       addPlayer(r, ws, m.name, m.cos);
     } else if (room) {
       const c = room.clients.get(ws.pid);
@@ -988,6 +1196,9 @@ wss.on('connection', (ws) => {
       const isHost = ws.pid === room.hostId;
       if (m.t === 'settings' && isHost && room.phase === 'lobby') {
         applySettings(room.settings, m.s);
+        if (m.s && typeof m.s.password === 'string') room.pw = m.s.password ? hashPw(room, m.s.password) : '';
+        if (room.settings.privacy === 'password' && !room.pw) room.settings.privacy = 'code';
+        room.settings.maxPlayers = Math.max(room.settings.maxPlayers, room.clients.size);
         broadcast(room, lobbyInfo(room));
       } else if (m.t === 'start' && isHost && room.phase === 'lobby') {
         room.clients.forEach((cl) => { cl.p.score = 0; });
@@ -1015,6 +1226,8 @@ wss.on('connection', (ws) => {
       } else if (m.t === 'input') {
         c.p.ix = Math.max(-1, Math.min(1, +m.x || 0));
         c.p.iz = Math.max(-1, Math.min(1, +m.z || 0));
+      } else if (m.t === 'emote') {
+        if (room.phase !== 'lobby' && c.p.emCd <= 0 && c.p.alive && !c.p.falling) { c.p.em = c.p.cos.emote || 'gear_flex'; c.p.emT = EMOTE_TIME; c.p.emCd = 8; }
       } else if (m.t === 'act' || m.t === 'shove') {
         doAct(room, c.p);
       }
