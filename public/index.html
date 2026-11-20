@@ -211,7 +211,7 @@ const HINTS = {
 const WEAPON_NAMES = { blaster: 'Blaster', hammer: 'Hammer', grenade: 'Grenade' };
 
 // ---------- personal settings (saved in this browser) ----------
-const local = { shadows: true, camera: 'normal', tags: true, sound: true, volume: 'normal', hitboxes: false };
+const local = { shadows: true, camera: 'normal', tags: true, hitboxes: false, master: 0.8, sfx: 0.8, music: 0.6, shake: true, colorblind: false, lowDetail: false };
 try { Object.assign(local, JSON.parse(localStorage.getItem('ffp-settings') || '{}')); } catch (e) { /* ignore */ }
 const saveLocal = () => { try { localStorage.setItem('ffp-settings', JSON.stringify(local)); } catch (e) { /* ignore */ } };
 
@@ -228,6 +228,8 @@ const CATALOG = {
     { id: 'sparks', name: 'Spark Trail', price: 150 }, { id: 'bubbles', name: 'Bubble Trail', price: 150 },
     { id: 'hearts', name: 'Heart Trail', price: 250 } ] },
 };
+const SYMBOLS = { '#ff5a36': '▲', '#35c9ff': '■', '#9be22e': '●', '#ffd21f': '◆', '#c06bff': '★', '#ff6bb5': '✚', '#ffffff': '○', '#2fe0b0': '⬟' };
+const sym = (c) => (local.colorblind && SYMBOLS[c] ? SYMBOLS[c] + ' ' : '');
 const wallet = { coins: 40, owned: {}, equipped: { hat: '', visor: '', trail: '' } };
 try {
   const w = JSON.parse(localStorage.getItem('ffp-wallet') || 'null');
@@ -347,6 +349,7 @@ for (let i = 0; i < MAXP; i++) {
 }
 let pIdx = 0;
 function spawnP(x, y, z, o) {
+  if (local.lowDetail && Math.random() < 0.65) return;
   const p = parts[pIdx]; pIdx = (pIdx + 1) % MAXP;
   const m = p.mesh;
   m.geometry = pGeo[o.shape || 'box'];
@@ -402,7 +405,7 @@ function bolt(x, z) {
 }
 const boomGeo = new THREE.SphereGeometry(1, 18, 12);
 let shakeAmt = 0, flashA = 0;
-const shake = (a) => { shakeAmt = Math.max(shakeAmt, a); };
+const shake = (a) => { if (local.shake) shakeAmt = Math.max(shakeAmt, a); };
 function flash(color, a) { $('flash').style.background = '#' + new THREE.Color(color).getHexString(); flashA = Math.max(flashA, a); }
 function myXZ() { const r = robots.get(myId); return r ? { x: r.g.position.x, z: r.g.position.z } : { x: 0, z: 0 }; }
 function fxBoom(x, z) {
@@ -417,13 +420,14 @@ function xzOfTile(i) { return { x: ((i % N) - (N - 1) / 2) * S, z: (Math.floor(i
 
 // ---------- sound (all synthesised in the browser, no audio files) ----------
 let actx = null, master = null, noiseBuf = null;
-const VOLUMES = { low: 0.25, normal: 0.55, high: 1 };
-function applyVolume() { if (master) master.gain.value = local.sound ? (VOLUMES[local.volume] || 0.55) : 0; }
+let sfxBus = null, musicBus = null;
+function applyVolume() { if (!master) return; master.gain.value = local.master; sfxBus.gain.value = local.sfx; musicBus.gain.value = local.music; }
 function initAudio() {
   try {
     if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
     actx = new (window.AudioContext || window.webkitAudioContext)();
     master = actx.createGain(); master.connect(actx.destination);
+    sfxBus = actx.createGain(); sfxBus.connect(master); musicBus = actx.createGain(); musicBus.connect(master);
     noiseBuf = actx.createBuffer(1, actx.sampleRate, actx.sampleRate);
     const d = noiseBuf.getChannelData(0);
     for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
@@ -442,7 +446,7 @@ function tone(freq, dur, o = {}) {
   if (slide) osc.frequency.exponentialRampToValueAtTime(Math.max(20, freq * slide), t + dur);
   g.gain.setValueAtTime(vol, t);
   g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-  osc.connect(g); g.connect(master);
+  osc.connect(g); g.connect(o.bus === 'music' ? musicBus : sfxBus);
   osc.start(t); osc.stop(t + dur + 0.03);
 }
 function noise(dur, o = {}) {
@@ -456,7 +460,7 @@ function noise(dur, o = {}) {
   g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
   let node = src;
   if (hp) { const h = actx.createBiquadFilter(); h.type = 'highpass'; h.frequency.value = hp; node.connect(h); node = h; }
-  node.connect(lo); lo.connect(g); g.connect(master);
+  node.connect(lo); lo.connect(g); g.connect(sfxBus);
   src.start(t); src.stop(t + dur + 0.03);
 }
 const gates = {};
@@ -495,7 +499,9 @@ const sfx = {
 
 function applyLocal() {
   applyVolume();
-  sun.castShadow = !!local.shadows;
+  sun.castShadow = !!local.shadows && !local.lowDetail;
+  renderer.setPixelRatio(local.lowDetail ? 1 : Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
   placeCamera();
   $('tags').style.display = local.tags ? '' : 'none';
 }
@@ -882,27 +888,50 @@ buildRoomSettings();
 
 // ---------- my settings ----------
 const LOCAL_UI = [
+  { sec: 'Audio' },
+  { k: 'master', label: 'Master volume', range: true },
+  { k: 'sfx', label: 'SFX volume', range: true },
+  { k: 'music', label: 'Music volume', range: true },
+  { sec: 'Visuals' },
+  { k: 'shake', label: 'Screen shake', opts: [['true', 'On'], ['false', 'Off']] },
+  { k: 'lowDetail', label: 'Low-detail mode', opts: [['false', 'Off'], ['true', 'On (faster)']] },
   { k: 'shadows', label: 'Shadows', opts: [['true', 'On'], ['false', 'Off (faster)']] },
   { k: 'camera', label: 'Camera distance', opts: [['close', 'Close'], ['normal', 'Normal'], ['far', 'Far']] },
   { k: 'tags', label: 'Name tags', opts: [['true', 'On'], ['false', 'Off']] },
   { k: 'hitboxes', label: 'Show hitboxes', opts: [['false', 'Off'], ['true', 'On']] },
-  { k: 'sound', label: 'Sound', opts: [['true', 'On'], ['false', 'Off']] },
-  { k: 'volume', label: 'Volume', opts: [['low', 'Low'], ['normal', 'Normal'], ['high', 'High']] },
+  { sec: 'Accessibility' },
+  { k: 'colorblind', label: 'Colorblind mode (shapes)', opts: [['false', 'Off'], ['true', 'On']] },
 ];
 function buildLocal(box) {
   LOCAL_UI.forEach((f) => {
+    if (f.sec) { const d = document.createElement('div'); d.className = 'sec'; d.textContent = f.sec; box.appendChild(d); return; }
     const row = document.createElement('div'); row.className = 'srow';
-    row.innerHTML = `<span>${f.label}</span><select data-lk="${f.k}">${f.opts.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>`;
+    row.innerHTML = f.range
+      ? `<span>${f.label}</span><input type="range" min="0" max="100" step="5" data-lk="${f.k}" style="width:140px;margin:0;padding:0">`
+      : `<span>${f.label}</span><select data-lk="${f.k}">${f.opts.map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select>`;
     box.appendChild(row);
   });
-  box.addEventListener('change', (e) => {
+  const onChange = (e) => {
     const k = e.target.dataset.lk; if (!k) return;
-    local[k] = (k === 'camera' || k === 'volume') ? e.target.value : e.target.value === 'true';
+    if (e.target.type === 'range') local[k] = (+e.target.value) / 100;
+    else local[k] = k === 'camera' ? e.target.value : e.target.value === 'true';
     saveLocal(); applyLocal(); syncLocalUI();
-    if (k === 'sound' || k === 'volume') { initAudio(); applyVolume(); if (local.sound) sfx.beep(); }
+    if (k === 'colorblind' && roomPlayers.length) renderLobby();
+  };
+  box.addEventListener('input', (e) => { if (e.target.type === 'range') { onChange(e); } });
+  box.addEventListener('change', (e) => {
+    onChange(e);
+    const k = e.target.dataset.lk;
+    if (k === 'master' || k === 'sfx') { initAudio(); applyVolume(); sfx.beep(); }
+    if (k === 'music') { initAudio(); applyVolume(); tone(660, 0.3, { vol: 0.2, bus: 'music' }); }
   });
 }
-function syncLocalUI() { document.querySelectorAll('select[data-lk]').forEach((s) => { s.value = String(local[s.dataset.lk]); }); }
+function syncLocalUI() {
+  document.querySelectorAll('[data-lk]').forEach((s) => {
+    if (s.type === 'range') { if (document.activeElement !== s) s.value = Math.round(local[s.dataset.lk] * 100); }
+    else s.value = String(local[s.dataset.lk]);
+  });
+}
 buildLocal($('localLobby')); buildLocal($('localGame'));
 
 // ---------- coins, toast ----------
@@ -1000,12 +1029,12 @@ function renderLobby() {
   const isHost = myId === hostId;
   $('roomTitle').textContent = roomSettings ? roomSettings.roomName + (roomSettings.isPublic ? ' (public)' : ' (private)') : '';
   $('plist').innerHTML = roomPlayers.map((p) =>
-    `<div class="pl"><span class="dot" style="background:${p.color}"></span><span style="flex:1">${esc(p.name)}${p.id === hostId ? ' (owner)' : ''}${p.id === myId ? ' - you' : ''}</span>` +
+    `<div class="pl"><span class="dot" style="background:${p.color}"></span><span style="flex:1">${sym(p.color)}${esc(p.name)}${p.id === hostId ? ' (owner)' : ''}${p.id === myId ? ' - you' : ''}</span>` +
     (isHost && p.id !== myId ? `<button class="mini kick" data-kick="${p.id}">Kick</button>` : '') + '</div>').join('');
   const mine = roomPlayers.find((p) => p.id === myId);
   $('swatches').innerHTML = palette.map((c) => {
     const taken = roomPlayers.some((p) => p.id !== myId && p.color === c);
-    return `<button class="sw${mine && mine.color === c ? ' mine' : ''}" data-c="${c}" style="background:${c}" ${taken ? 'disabled' : ''}></button>`;
+    return `<button class="sw${mine && mine.color === c ? ' mine' : ''}" data-c="${c}" style="background:${c};color:#000;font-size:16px" ${taken ? 'disabled' : ''}>${local.colorblind ? SYMBOLS[c] || '' : ''}</button>`;
   }).join('');
   $('startBtn').style.display = isHost ? '' : 'none';
   $('wait').textContent = isHost ? (roomPlayers.length < 2 ? 'Solo test mode works too. Invite friends for the real thing.' : 'Use the Room tab to change rounds, minigames and points.') : 'Waiting for the owner to start...';
@@ -1120,7 +1149,7 @@ function onState() {
     let extra = '';
     if (s.game === 'armory' && p.alive) extra = ' ' + '♥'.repeat(Math.max(0, p.hp));
     if (s.game === 'hill') extra = ` ${Math.floor(p.ht)}s`;
-    return `<div style="color:${p.color}"><span>${esc(p.name)}${p.alive || s.game === 'hill' ? extra : ' x'}</span><b>${p.score}${showGain && p.gain ? ` (+${p.gain})` : ''}</b></div>`;
+    return `<div style="color:${p.color}"><span>${sym(p.color)}${esc(p.name)}${p.alive || s.game === 'hill' ? extra : ' x'}</span><b>${p.score}${showGain && p.gain ? ` (+${p.gain})` : ''}</b></div>`;
   }).join('');
 
   const holder = s.players.find((p) => p.id === s.holder);
@@ -1267,12 +1296,12 @@ function frame() {
     if (tickAcc <= 0) { sfx.tick(st.fuse < 3); tickAcc = st.fuse < 3 ? 0.15 : st.fuse < 6 ? 0.35 : 0.7; }
   }
   // musical chairs tune while the music is on
-  if (st && st.music && local.sound && actx) {
+  if (st && st.music && local.master > 0 && local.music > 0 && actx) {
     musicAcc -= dt;
     if (musicAcc <= 0) {
       musicStep = (musicStep + 1) % 16;
-      tone(523 * Math.pow(2, MELODY[musicStep] / 12), 0.16, { vol: 0.1 });
-      if (musicStep % 4 === 0) tone(131 * Math.pow(2, MELODY[musicStep] / 12), 0.3, { type: 'triangle', vol: 0.18 });
+      tone(523 * Math.pow(2, MELODY[musicStep] / 12), 0.16, { vol: 0.1, bus: 'music' });
+      if (musicStep % 4 === 0) tone(131 * Math.pow(2, MELODY[musicStep] / 12), 0.3, { type: 'triangle', vol: 0.18, bus: 'music' });
       musicAcc = 0.19;
     }
   }
@@ -1281,7 +1310,7 @@ function frame() {
     shake(0.18);
     quakeAcc -= dt;
     if (quakeAcc <= 0) {
-      quakeAcc = 0.12; if (local.sound) sfx.rumble();
+      quakeAcc = 0.12; sfx.rumble();
       const tx = (Math.random() * 2 - 1) * (HALF - 1), tz = (Math.random() * 2 - 1) * (HALF - 1);
       burst(tx, 0.1, tz, 3, { color: 0x9a8f80, speed: 1.2, up: 2, life: 0.8, size: 0.25, g: -0.2 });
     }
@@ -1426,7 +1455,7 @@ function frame() {
     const showTag = g.visible && (r.alive || (r.dm === 0 && r.ty > -3));
     r.el.style.display = showTag ? '' : 'none';
     const hearts = st && st.game === 'armory' && r.alive ? ' ' + '♥'.repeat(Math.max(0, r.hp || 0)) : '';
-    r.el.textContent = r.name + (id === myId ? ' (you)' : '') + hearts;
+    r.el.textContent = sym(r.color) + r.name + (id === myId ? ' (you)' : '') + hearts;
   }
   void meMine;
 
