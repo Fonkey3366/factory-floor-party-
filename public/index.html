@@ -118,6 +118,8 @@
   #thumb { position: absolute; bottom: 70px; left: 50%; transform: translateX(-50%); width: auto; pointer-events: auto; display: none; }
   .mrow { display: flex; align-items: center; justify-content: space-between; gap: 4px; }
   .star { cursor: pointer; color: #555; font-size: 17px; padding: 0 4px; } .star.on { color: #ffd21f; }
+  body.simple #hint, body.simple #roomtag, body.simple #thumb, body.simple #pmShow, body.simple #streakInfo { display: none !important; }
+  body.simple #top { background: none; box-shadow: none; }
   .botTag { font-size: 10px; background: #333; padding: 1px 4px; border-radius: 3px; margin-left: 4px; }
 </style>
 </head>
@@ -238,6 +240,7 @@ const GAME_LABELS = {
   meteors: 'Falling Meteors', disasters: 'Natural Disasters', hill: 'King of the Hill', zombies: 'Zombie Survival', chairs: 'Musical Chairs',
   conveyor_roulette: 'Conveyor Roulette', express_train: 'Express Train', press_memory: 'Press Memory',
   scrap_workbench: 'Scrap Workbench', boss_takedown: 'Boss Takedown', shape_dash: 'Color / Shape Dash', red_light: 'Red Light, Green Light',
+  knife_dark: 'Knife in the Dark', sniper: 'Sniper Run',
 };
 const HINTS = {
   crumble: 'Floor cracks under your feet. Keep moving, shove rivals off.',
@@ -256,6 +259,8 @@ const HINTS = {
   boss_takedown: 'Dodge the boss attacks. When its core is exposed, hit it with a wrench!',
   shape_dash: 'A zone is called - get on it before the rest of the floor drops away!',
   red_light: 'Run to the scanner on green. Freeze on red or get blasted back!',
+  knife_dark: 'The office lights are out. Find the hidden knife - whoever grabs it hunts the rest. Shove the killer off the edge!',
+  sniper: 'One of you is the sniper. Runners: reach the finish line before the sniper picks you off. Zigzag!',
 };
 const CHAOS_UI = [
   ['low_gravity', 'Low Gravity', 'Shoves send players flying, falls are slower'],
@@ -272,7 +277,7 @@ const DEFAULT_KEYS = { up: ['KeyW', 'ArrowUp'], down: ['KeyS', 'ArrowDown'], lef
 const local = {
   v: 2, master: 0.8, sfx: 0.8, music: 0.6, muteUnfocused: true,
   shake: 100, particles: 'high', fpsCap: 60, fullscreen: false, shadows: true, camera: 'normal', tags: true, hitboxes: false,
-  colorblind: false, hazardOutlines: true, contrastTags: false, reduceFlashes: false,
+  colorblind: false, simpleUI: false, hazardOutlines: true, contrastTags: false, reduceFlashes: false,
   deadzone: 0.15, padAction: 0, padEmote: 3, keys: JSON.parse(JSON.stringify(DEFAULT_KEYS)),
 };
 try {
@@ -352,7 +357,7 @@ scene.fog = new THREE.Fog(0x0c0d10, 60, 130);
 const camera = new THREE.PerspectiveCamera(48, innerWidth / innerHeight, 0.1, 200);
 const camBase = new THREE.Vector3();
 
-scene.add(new THREE.HemisphereLight(0xb8c8ff, 0x4a3020, 1.6));
+const hemi = new THREE.HemisphereLight(0xb8c8ff, 0x4a3020, 1.6); scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xffe2c0, 2.6);
 sun.position.set(8, 20, 6);
 sun.castShadow = true;
@@ -404,6 +409,8 @@ const TILE_COLORS = {
   boss_takedown: [0x4a3f3f, 0x5a4d4d],
   shape_dash: [0x3a3c46, 0x4a4c58],
   red_light: [0x4a5a4a, 0x5a6c5a],
+  knife_dark: [0x2a2e36, 0x31363f],
+  sniper: [0x4a4f58, 0x565c66],
 };
 const tileGeo = new THREE.BoxGeometry(S - 0.08, 0.5, S - 0.08);
 const pressGeo = new THREE.BoxGeometry(S - 0.1, 1.6, S - 0.1);
@@ -667,6 +674,7 @@ function applyLocal() {
   sun.castShadow = !!local.shadows && local.particles !== 'low';
   renderer.setPixelRatio(local.particles === 'low' ? 1 : Math.min(devicePixelRatio, 2));
   document.body.classList.toggle('hc', !!local.contrastTags);
+  document.body.classList.toggle('simple', !!local.simpleUI);
   renderer.setSize(innerWidth, innerHeight);
   placeCamera();
   $('tags').style.display = local.tags ? '' : 'none';
@@ -993,7 +1001,7 @@ function sync(map, list, make, update) {
 }
 function clearWorld() {
   for (const map of [pickupMeshes, projMeshes, bombMeshes, zombieMeshes, meteorMeshes, partMeshes, benchMeshes]) { for (const m of map.values()) scene.remove(m.obj); map.clear(); }
-  hillGrp.visible = false; vortex.visible = false; bossGrp.visible = false; scanGrp.visible = false;
+  hillGrp.visible = false; vortex.visible = false; bossGrp.visible = false; scanGrp.visible = false; officeGrp.visible = false; snipGrp.visible = false; knifeGround.visible = false; knifeGlow.visible = false; flashlight.intensity = 0;
   bossBeams.forEach((b) => { b.visible = false; }); bossRings.forEach((b) => { b.visible = false; });
 }
 
@@ -1042,6 +1050,49 @@ const bossRings = [0, 1, 2, 3].map(() => {
   g.add(fill, rg); g.userData = { fill }; g.visible = false; scene.add(g); return g;
 });
 let bossLid = 0;
+
+// Office (Knife in the Dark): decorative desks, knife, flashlight
+const officeGrp = new THREE.Group();
+{
+  const deskMat = bMat(0x6b4a2e), topM = bMat(0x8a6a48), pot = bMat(0x2e7d3a);
+  for (const [dx, dz, rot] of [[-7.4, -5, 0], [-7.4, 0, 0], [-7.4, 5, 0], [7.4, -5, 0], [7.4, 0, 0], [7.4, 5, 0], [-2.5, -7.6, Math.PI / 2], [3.0, 7.6, Math.PI / 2]]) {
+    const d = new THREE.Group();
+    const top = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.08, 2.0), topM); top.position.y = 0.75;
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.7, 1.9), deskMat); leg.position.y = 0.36;
+    const mon = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.45, 0.7), new THREE.MeshStandardMaterial({ color: 0x111418, emissive: 0x1a3a55, emissiveIntensity: 0.8 })); mon.position.set(0.2, 1.05, 0);
+    d.add(leg, top, mon); d.position.set(dx, 0, dz); d.rotation.y = rot; d.traverse((o) => { if (o.isMesh) o.castShadow = true; });
+    officeGrp.add(d);
+  }
+  for (const [px, pz] of [[-7.8, -8], [7.8, -8], [-7.8, 8], [7.8, 8]]) {
+    const b = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.25, 0.5, 10), bMat(0x884433)); b.position.set(px, 0.25, pz);
+    const l = new THREE.Mesh(new THREE.SphereGeometry(0.55, 10, 8), pot); l.position.set(px, 0.95, pz);
+    officeGrp.add(b, l);
+  }
+}
+officeGrp.visible = false; scene.add(officeGrp);
+function makeKnifeMesh() {
+  const g = new THREE.Group();
+  const blade = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.03, 0.75), new THREE.MeshStandardMaterial({ color: 0xe8eef5, metalness: 0.9, roughness: 0.15, emissive: 0x4488aa, emissiveIntensity: 0.6 })); blade.position.z = 0.35;
+  const handle = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.12, 0.35), bMat(0x2a1a14)); handle.position.z = -0.15;
+  g.add(blade, handle); return g;
+}
+const knifeGround = makeKnifeMesh(); knifeGround.scale.setScalar(1.3); knifeGround.visible = false; scene.add(knifeGround);
+const knifeGlow = new THREE.Mesh(new THREE.RingGeometry(0.5, 0.62, 24), new THREE.MeshBasicMaterial({ color: 0x66ddff, transparent: true, opacity: 0.6, side: THREE.DoubleSide, depthWrite: false })); knifeGlow.rotation.x = -Math.PI / 2; knifeGlow.position.y = 0.05; knifeGlow.visible = false; scene.add(knifeGlow);
+const flashlight = new THREE.PointLight(0xfff0cc, 0, 11, 1.4); flashlight.position.y = 3; scene.add(flashlight);
+
+// Sniper tower, laser and finish line
+const snipGrp = new THREE.Group();
+{
+  const base = new THREE.Mesh(new THREE.BoxGeometry(3, 1.8, 1.4), bMat(0x30343c)); base.position.set(0, 0.9, -HALF - 0.1); base.castShadow = true;
+  const hood = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.6, 1.0), bMat(0x8a2a22)); hood.position.set(0, 2.1, -HALF - 0.1);
+  const eye = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.18, 0.1), new THREE.MeshBasicMaterial({ color: 0xff3a1a })); eye.position.set(0, 2.1, -HALF + 0.42);
+  snipGrp.add(base, hood, eye);
+  const fin = new THREE.Mesh(new THREE.PlaneGeometry(N * S, 0.8), new THREE.MeshBasicMaterial({ map: stripes })); fin.rotation.x = -Math.PI / 2; fin.position.set(0, 0.03, -(HALF - 2.8)); snipGrp.add(fin);
+  const st0 = new THREE.Mesh(new THREE.PlaneGeometry(N * S, 0.2), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5 })); st0.rotation.x = -Math.PI / 2; st0.position.set(0, 0.03, 6.4); snipGrp.add(st0);
+}
+const laserMat = new THREE.MeshBasicMaterial({ color: 0xff2a1a, transparent: true, opacity: 0.35, depthWrite: false });
+const laser = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.07, 20), laserMat); laser.position.y = 1.0; snipGrp.add(laser);
+snipGrp.visible = false; scene.add(snipGrp);
 
 // Red light scanner gantry at the far end
 const scanGrp = new THREE.Group();
@@ -1388,6 +1439,7 @@ const LOCAL_UI = [
   { k: 'hazardOutlines', label: 'Colorblind hazard outlines', opts: onOff },
   { k: 'contrastTags', label: 'High-contrast nameplates', opts: [[false, 'Off'], [true, 'On']] },
   { k: 'reduceFlashes', label: 'Reduce screen flashes', opts: [[false, 'Off'], [true, 'On']] },
+  { k: 'simpleUI', label: 'Simple UI (hide hints & extras)', opts: [[false, 'Off'], [true, 'On']] },
 ];
 const KEY_ACTIONS = [['up', 'Move up'], ['down', 'Move down'], ['left', 'Move left'], ['right', 'Move right'], ['action', 'Shove / use weapon'], ['emote', 'Emote']];
 const keyLabel = (c) => (c ? c.replace(/^Key/, '').replace(/^Arrow/, '↔').replace('↔Up', '↑').replace('↔Down', '↓').replace('↔Left', '←').replace('↔Right', '→').replace(/^Digit/, '').replace('ShiftLeft', 'Shift') : '—');
@@ -1707,10 +1759,12 @@ function onState() {
 
   const me = s.players.find((p) => p.id === myId);
   const wEl = $('weapon');
-  if ((s.game === 'armory' || s.game === 'scrap_workbench' || s.game === 'boss_takedown') && me && s.phase !== 'roundEnd') {
+  if ((s.game === 'armory' || s.game === 'scrap_workbench' || s.game === 'boss_takedown' || s.game === 'knife_dark' || s.game === 'sniper') && me && s.phase !== 'roundEnd') {
     wEl.style.display = 'block';
     if (me.w) wEl.textContent = `${WEAPON_NAMES[me.w]} x${me.ammo}`;
     else if (s.game === 'scrap_workbench') wEl.textContent = me.carry ? `Carrying ${me.carry} - bring it to your bench (2 parts = a weapon)` : 'Walk over parts to pick them up. SPACE near a rival bench = steal';
+    else if (s.game === 'knife_dark') wEl.textContent = s.kn && s.kn.h === myId ? 'YOU HAVE THE KNIFE - SPACE to stab, eliminate everyone!' : s.kn && s.kn.h ? 'Someone has the knife! Stay away - or shove them off the edge (SPACE)' : 'Find the knife in the dark! Walk around...';
+    else if (s.game === 'sniper') wEl.textContent = s.sn && s.sn.id === myId ? 'You are the SNIPER: left/right aims, SPACE fires (laser locks for 0.4s)' : s.sn && s.sn.fin.includes(myId) ? 'You made it! Safe.' : 'RUN to the finish line! Zigzag to dodge the laser.';
     else if (s.game === 'boss_takedown') wEl.textContent = 'Grab a wrench from the outer ring, then smash the exposed core!';
     else wEl.textContent = 'No weapon - walk over a pickup (SPACE = shove)';
   } else wEl.style.display = 'none';
@@ -1746,6 +1800,11 @@ function onState() {
     applyCosmetics(r.g, r.cos);
     if (p.em && !r.emSeen) { r.emOn = true; r.emId = p.em; r.emT0 = performance.now(); const f = sfx[EMOTE_SFX[p.em]]; if (f && actx) f(); }
     r.emSeen = !!p.em;
+    const hasK = !!(s.kn && s.kn.h === p.id);
+    if (hasK !== !!r.knifeMesh) {
+      if (r.knifeMesh) { r.g.remove(r.knifeMesh); r.knifeMesh = null; }
+      if (hasK) { r.knifeMesh = makeKnifeMesh(); r.knifeMesh.position.set(0.7, 1.1, 0.5); r.g.add(r.knifeMesh); }
+    }
     if ((p.carry || '') !== (r.carry || '')) {
       if (r.carryMesh) { r.g.remove(r.carryMesh); r.carryMesh = null; }
       if (p.carry) { r.carryMesh = makePartMesh(p.carry); r.carryMesh.scale.setScalar(0.65); r.carryMesh.position.set(0, 2.65, 0); r.g.add(r.carryMesh); if (!r.carry && actx && gate('carry' + p.id, 150)) sfx.pickup(); }
@@ -2086,6 +2145,33 @@ function frame() {
   }
 
   const meMine = robots.get(myId);
+  const kd = !!(st && st.game === 'knife_dark' && st.phase !== 'lobby');
+  const dark = kd && !!(meMine && meMine.alive);
+  hemi.intensity += ((dark ? 0.22 : 1.6) - hemi.intensity) * Math.min(1, dt * 6);
+  sun.intensity += ((dark ? 0.05 : 2.6) - sun.intensity) * Math.min(1, dt * 6);
+  scene.background.setHex(dark ? 0x010102 : 0x0c0d10); scene.fog.color.setHex(dark ? 0x010102 : 0x0c0d10);
+  scene.fog.near = dark ? 28 : 60; scene.fog.far = dark ? 55 : 130;
+  officeGrp.visible = kd;
+  flashlight.intensity = dark ? 220 : 0;
+  if (meMine) flashlight.position.set(meMine.g.position.x, 3.2, meMine.g.position.z);
+  const kn = kd ? st.kn : null;
+  const kShow = !!(kn && !kn.h && st.phase !== 'lobby');
+  knifeGround.visible = kShow; knifeGlow.visible = kShow;
+  if (kShow) {
+    knifeGround.position.set(kn.x, 0.5 + Math.sin(t * 3) * 0.08, kn.z); knifeGround.rotation.y = t * 1.5;
+    knifeGlow.position.x = kn.x; knifeGlow.position.z = kn.z; knifeGlow.scale.setScalar(1 + 0.2 * Math.sin(t * 4));
+    if (dark && meMine && Math.hypot(kn.x - meMine.g.position.x, kn.z - meMine.g.position.z) > 6) { knifeGround.visible = false; knifeGlow.visible = false; }
+  }
+  const sg = !!(st && st.game === 'sniper' && st.sn && st.phase !== 'lobby');
+  snipGrp.visible = sg;
+  if (sg) {
+    const sp = robots.get(st.sn.id);
+    const ox = sp ? sp.g.position.x : 0, oz = sp ? sp.g.position.z : -HALF + 0.8;
+    laser.position.set(ox + Math.sin(st.sn.ang) * 10, 1.0, oz + Math.cos(st.sn.ang) * 10); laser.rotation.y = st.sn.ang;
+    laserMat.opacity = st.sn.lock ? 0.95 : 0.3 + 0.1 * Math.sin(t * 8);
+    laserMat.color.setHex(st.sn.lock ? 0xffffff : 0xff2a1a);
+    laser.scale.x = laser.scale.y = st.sn.lock ? 2.4 : 1;
+  }
   for (const [id, r] of robots) {
     const g = r.g;
     if (r.emOn) {
@@ -2114,6 +2200,7 @@ function frame() {
     g.scale.y += (sy - g.scale.y) * ks;
     g.scale.x += (sx - g.scale.x) * ks; g.scale.z = g.scale.x;
     g.visible = r.ty > -12 && g.scale.x > 0.03 && !!state && state.phase !== 'lobby';
+    if (dark && id !== myId && Math.hypot(g.position.x - meMine.g.position.x, g.position.z - meMine.g.position.z) > 7) g.visible = false;
     g.rotation.x = r.act ? -0.3 : 0;
     g.rotation.z = r.emRz || 0;
     g.userData.hit.visible = local.hitboxes;
