@@ -40,6 +40,8 @@ const GAMES = {
   boss_takedown: 'Boss Takedown',
   shape_dash: 'Color / Shape Dash',
   red_light: 'Red Light, Green Light',
+  knife_dark: 'Knife in the Dark',
+  sniper: 'Sniper Run',
 };
 const CHAOS = ['low_gravity', 'slippery_oil', 'double_hazard', 'sudden_death', 'tiny_arena', 'heavy_bots'];
 const DURATIONS = [60, 90, 120, 180];
@@ -54,7 +56,7 @@ const MODE_OPTS = {
   red_light: { penalty: { o: ['blast', 'eliminate'], d: 'blast' }, pace: { o: ['slow', 'normal', 'fast'], d: 'normal' } },
   press_memory: { startLength: { o: [1, 2, 3, 4, 5], d: 2 }, showSpeed: { o: ['slow', 'normal', 'fast'], d: 'normal' }, symbols: { o: [4, 6], d: 4 } },
 };
-const TIMED = { hill: 45, zombies: 40 }; // seconds, these modes end on a timer
+const TIMED = { hill: 45, zombies: 40, knife_dark: 75, sniper: 45 }; // seconds, these modes end on a timer
 const HILL_R = 2.6;
 const SPEEDS = { slow: 5.2, normal: 6.5, fast: 8.2 };
 const SHOVES = { off: 0, normal: 15, strong: 26 };
@@ -362,6 +364,8 @@ function startRound(room) {
   room.wb = { parts: [], benches: [], t: 1 };
   room.boss = { mhp: 0, hp: 0, ph: 1, st: 'idle', t: 2.5, atk: '', rings: [], arms: [], hitT: 0, pt: 1, hitSet: new Set(), dur: 1 };
   room.rl = { ph: 'green', t: 1.6, age: 0 };
+  room.kn = { x: 0, z: 0, holder: 0 };
+  room.sn = { id: 0, ang: 0, lock: 0, lockAng: 0, cd: 1.5, fin: [], over: false };
   room.forced = null; room.bossDead = false;
   const list = playersOf(room);
   room.startCount = list.length;
@@ -381,6 +385,17 @@ function startRound(room) {
   });
   if (room.game === 'red_light') {
     list.forEach((p, i) => { p.x = list.length > 1 ? -7 + (i * 14) / (list.length - 1) : 0; p.z = 5.5; p.ry = Math.PI; });
+  }
+  if (room.game === 'knife_dark') {
+    const a = Math.random() * Math.PI * 2, r = 2.5 + Math.random() * 5;
+    room.kn.x = Math.cos(a) * r; room.kn.z = Math.sin(a) * r;
+  }
+  if (room.game === 'sniper') {
+    const sp = list.length > 1 ? list[room.round % list.length] : null;
+    room.sn.id = sp ? sp.id : 0;
+    const runners = list.filter((q) => q !== sp);
+    runners.forEach((q, i) => { q.x = runners.length > 1 ? -7 + (i * 14) / (runners.length - 1) : 0; q.z = 7.6; q.ry = Math.PI; });
+    if (sp) { sp.x = 0; sp.z = -HALF + 0.8; sp.ry = 0; }
   }
   if (room.game === 'scrap_workbench') {
     list.forEach((p, i) => {
@@ -517,8 +532,14 @@ function update(room) {
     if (room.game === 'hill') over = room.elapsed >= cap;
     else if (room.game === 'boss_takedown') over = room.bossDead || alive.length === 0 || room.elapsed > cap;
     else if (room.game === 'red_light') over = !!room.forced || alive.length <= limit || room.elapsed > cap;
+    else if (room.game === 'knife_dark') over = alive.length <= limit || room.elapsed > cap || (room.kn.holder > 0 && !alive.some((q) => q.id === room.kn.holder));
+    else if (room.game === 'sniper') over = room.sn.over || room.elapsed > cap;
     else over = alive.length <= limit || room.elapsed > cap;
-    if (over) finishRound(room, players);
+    if (over) {
+      if (room.game === 'knife_dark' && room.kn.holder) { const h = alive.find((q) => q.id === room.kn.holder); if (h && alive.length > 1) { h.god = false; eliminate(room, h, 2, false); settleDeaths(room); } }
+      if (room.game === 'sniper') endSniper(room, players);
+      finishRound(room, players);
+    }
   } else if (room.phase === 'roundEnd') {
     room.timer -= dt;
     if (room.timer <= 0) {
@@ -695,6 +716,8 @@ function updateHazards(room, players, dt) {
   if (room.game === 'scrap_workbench') updateWorkbench(room, players, live, dt, rate);
   if (room.game === 'boss_takedown') updateBoss(room, players, live, dt, rate);
   if (room.game === 'red_light') updateRedLight(room, players, live, dt);
+  if (room.game === 'knife_dark') updateKnife(room, players, live, dt);
+  if (room.game === 'sniper') updateSniper(room, players, live, dt);
 
   if (room.sd && room.elapsed >= room.sd.at) {
     room.sd.t -= dt;
@@ -1001,6 +1024,54 @@ function fillBots(room) {
   if (!st.botFill) { [...room.clients.entries()].forEach(([id, c]) => { if (c.p.bot) room.clients.delete(id); }); return; }
   while (room.clients.size < Math.min(st.botTarget, st.maxPlayers)) addBot(room);
 }
+function updateKnife(room, players, live, dt) {
+  const k = room.kn;
+  if (k.holder) return;
+  for (const p of live) if (Math.hypot(p.x - k.x, p.z - k.z) < 1.0) { k.holder = p.id; room.fx.push({ id: room.eid++, k: 'spark', x: p.x, z: p.z, t: 0.5 }); break; }
+}
+function updateSniper(room, players, live, dt) {
+  const sn = room.sn;
+  const sp = players.find((q) => q.id === sn.id);
+  const runners = players.filter((q) => q !== sp);
+  if (sp) {
+    sn.cd = Math.max(0, sn.cd - dt);
+    if (sn.lock <= 0) sn.ang = Math.max(-1.15, Math.min(1.15, sn.ang + sp.ix * dt * 1.6));
+    sp.x = 0; sp.z = -HALF + 0.8; sp.vx = sp.vz = sp.kx = sp.kz = 0; sp.ry = sn.lock > 0 ? sn.lockAng : sn.ang;
+    if (sn.lock > 0) {
+      sn.lock -= dt;
+      if (sn.lock <= 0) {
+        const dx = Math.sin(sn.lockAng), dz = Math.cos(sn.lockAng);
+        let best = null, bd = 99;
+        for (const q of runners) {
+          if (!q.alive || q.falling || sn.fin.includes(q.id)) continue;
+          const rx = q.x - sp.x, rz = q.z - sp.z, along = rx * dx + rz * dz, perp = Math.abs(rx * dz - rz * dx);
+          if (along > 0 && perp < 0.85 && along < bd) { best = q; bd = along; }
+        }
+        sp.actFx = 0.25;
+        if (best) { eliminate(room, best, 2, false); sp.kills++; room.fx.push({ id: room.eid++, k: 'boom', x: best.x, z: best.z, t: 0.5 }); }
+      }
+    }
+  }
+  for (const q of runners) if (q.alive && !q.falling && q.z < -(HALF - 2.8) && !sn.fin.includes(q.id)) sn.fin.push(q.id);
+  sn.over = runners.length > 0 && runners.every((q) => !q.alive || sn.fin.includes(q.id));
+}
+function endSniper(room, players) {
+  const sn = room.sn;
+  const sp = players.find((q) => q.id === sn.id);
+  const runners = players.filter((q) => q !== sp);
+  for (const q of runners) q.god = false;
+  if (sp) sp.god = false;
+  if (sn.fin.length) {
+    room.forced = players.find((q) => q.id === sn.fin[0]) || null;
+    runners.forEach((q) => { if (q.alive && !sn.fin.includes(q.id)) eliminate(room, q, 2, false); });
+    if (sp) eliminate(room, sp, 2, false);
+  } else {
+    room.forced = sp || null;
+    runners.forEach((q) => eliminate(room, q, 2, false));
+  }
+  settleDeaths(room);
+}
+
 function botThink(room, p) {
   p.ix = 0; p.iz = 0;
   if (room.phase !== 'play' || !p.alive || p.falling) return;
@@ -1021,6 +1092,25 @@ function botThink(room, p) {
     if (rl.ph === 'green') { p.bkStop = Math.random() < lvl; go(p.x * 0.9, -HALF); }
     else if (rl.ph === 'warn') { if (p.bkStop === undefined || p.bkStop) { p.ix = 0; p.iz = 0; } else go(p.x, -HALF); }
     return;
+  }
+  if (g === 'sniper') {
+    const sn = room.sn;
+    if (p.id === sn.id) {
+      const t = nearest(others.filter((q) => !sn.fin.includes(q.id)));
+      if (t) {
+        const err = Math.atan2(t.x - p.x, t.z - p.z) - sn.ang;
+        p.ix = Math.max(-1, Math.min(1, err * 4));
+        if (sn.lock <= 0 && sn.cd <= 0 && Math.abs(err) < 0.12 && Math.random() < 0.35 * lvl) doAct(room, p);
+      }
+    } else if (sn.fin.includes(p.id)) { p.ix = 0; p.iz = 0; }
+    else { p.ix = Math.sin(room.elapsed * (2.2 + (p.id % 3) * 0.5) + p.id) * (0.5 + 0.5 * lvl); p.iz = -1; }
+    return;
+  }
+  if (g === 'knife_dark') {
+    const k = room.kn;
+    if (k.holder === p.id) { const t = nearest(others); if (t) { go(t.x, t.z); if (dist(t) < 1.7) doAct(room, p); } return; }
+    if (k.holder) { const h = others.find((q) => q.id === k.holder); if (h && dist(h) < 4) { flee(h.x, h.z); return; } }
+    else if ((p.id + room.round) % 2 === 0 && Math.random() < 0.97) { go(k.x + Math.sin(room.elapsed + p.id) * 2, k.z + Math.cos(room.elapsed * 1.3 + p.id) * 2); return; }
   }
   if (g === 'express_train' && room.tr.ph !== 'idle') {
     const pad = nearest(room.tr.pads.map(tileCenter));
@@ -1366,6 +1456,21 @@ function doAct(room, p) {
   const dirx = Math.sin(p.ry), dirz = Math.cos(p.ry);
   const players = playersOf(room);
   const weaponMode = room.game === 'armory' || room.game === 'scrap_workbench';
+  if (room.game === 'sniper' && p.id === room.sn.id) {
+    if (room.sn.cd <= 0 && room.sn.lock <= 0) { room.sn.lock = 0.4; room.sn.lockAng = room.sn.ang; room.sn.cd = 1.7; }
+    return;
+  }
+  if (room.game === 'knife_dark' && room.kn.holder === p.id) {
+    if (p.useCd > 0) return;
+    p.useCd = 0.8; p.actFx = 0.25;
+    const dx = Math.sin(p.ry), dz = Math.cos(p.ry);
+    for (const q of players) {
+      if (q === p || !q.alive || q.falling) continue;
+      const rx = q.x - p.x, rz = q.z - p.z, d = Math.hypot(rx, rz);
+      if (d < 1.9 && (d < 0.8 || (rx * dx + rz * dz) / d > -0.2)) { eliminate(room, q, 2, false); p.kills++; room.fx.push({ id: room.eid++, k: 'spark', x: q.x, z: q.z, t: 0.5 }); }
+    }
+    return;
+  }
   if (room.game === 'boss_takedown' && p.weapon === 'wrench') {
     if (p.useCd > 0) return;
     p.useCd = 0.45; p.actFx = 0.25;
@@ -1461,6 +1566,8 @@ function snapshot(room) {
     benches: g === 'scrap_workbench' ? room.wb.benches.map((b) => ({ o: b.o, x: +b.x.toFixed(2), z: +b.z.toFixed(2), s: b.s, c: b.c > 0 ? +(1 - b.c / b.cm).toFixed(2) : 0 })) : [],
     boss: g === 'boss_takedown' ? { hp: Math.max(0, Math.round(room.boss.hp)), mhp: room.boss.mhp, ph: room.boss.ph, st: room.boss.st, atk: room.boss.atk, p: room.boss.st === 'tele' ? +(1 - room.boss.t / room.boss.dur).toFixed(2) : 0, hit: room.boss.hitT > 0, rings: room.boss.rings.map((r) => ({ x: +r.x.toFixed(2), z: +r.z.toFixed(2), r: r.r })), arms: room.boss.arms.map((a) => +a.a.toFixed(3)) } : null,
     rl: g === 'red_light' ? { ph: room.rl.ph } : null,
+    kn: g === 'knife_dark' ? { h: room.kn.holder, x: room.kn.holder ? 0 : +room.kn.x.toFixed(2), z: room.kn.holder ? 0 : +room.kn.z.toFixed(2) } : null,
+    sn: g === 'sniper' ? { id: room.sn.id, ang: +(room.sn.lock > 0 ? room.sn.lockAng : room.sn.ang).toFixed(3), lock: room.sn.lock > 0, cd: room.sn.cd > 0, fin: room.sn.fin } : null,
     music: g === 'chairs' && room.phase === 'play' && room.mc.phase === 'music',
     players: players.map((p) => ({
       id: p.id, name: p.name, color: p.color, score: p.score, gain: p.gain, cg: p.coins, ht: Math.round(p.ht * 10) / 10,
